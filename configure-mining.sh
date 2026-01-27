@@ -36,7 +36,11 @@ install_dependencies() {
         echo -e "${RED}Ошибка: Не найден yay или paru.${NC}"; exit 1;
     fi
 
-    sudo pacman -S --needed --noconfirm nvidia nvidia-utils cuda gamemode xmrig git base-devel xprintidle
+    # --- ИСПРАВЛЕНИЕ КОНФЛИКТА ДРАЙВЕРОВ ---
+    # Мы убрали 'nvidia' и 'nvidia-utils' из списка, так как на CachyOS они уже стоят.
+    # Ставим только CUDA и утилиты.
+    echo -e "${YELLOW}Пропускаем установку драйвера (используем системный), ставим утилиты...${NC}"
+    sudo pacman -S --needed --noconfirm cuda gamemode xmrig git base-devel xprintidle
 
     echo -e "${BLUE}Выберите майнер для GPU:${NC}"
     echo "1) Gminer (KawPow/RVN - Рекомендуется)"
@@ -62,7 +66,6 @@ setup_config() {
 
     source /tmp/miner_path
 
-    # Дефолтные настройки
     if [[ "$MINER_BIN" == *"rigel"* ]]; then
         ALGO="nexapow"
         SERVER="pool.woolypooly.com:3094"
@@ -71,22 +74,19 @@ setup_config() {
         SERVER="ravencoin.flypool.org:3333"
     fi
 
-    # В конфиге больше нет настроек питания
+    # Настройки: CPU включен (т.к. у вас Unlock TB), таймаут 60 сек
     cat <<EOF > "$ENV_FILE"
 MINER_BIN=$MINER_BIN
 GPU_ALGO=$ALGO
 GPU_SERVER=$SERVER
 GPU_WALLET=$gpu_wal
 CPU_WALLET=$cpu_wal
-# Включать ли CPU майнинг через Watchdog? (true/false)
-# Т.к. у вас Unlock Turbo Boost, ставим true по умолчанию
 USE_CPU_MINING=true
-# Время простоя в секундах до запуска майнинга
 IDLE_TIMEOUT=60
 EOF
 }
 
-# --- 2. СОЗДАНИЕ СЛУЖБ МАЙНЕРОВ ---
+# --- 2. СОЗДАНИЕ СЛУЖБ ---
 create_miner_services() {
     echo -e "${BLUE}=== [3/4] Создание служб Systemd ===${NC}"
     mkdir -p "$HOME/.config/systemd/user/"
@@ -100,7 +100,6 @@ After=network.target
 [Service]
 Type=simple
 EnvironmentFile=$ENV_FILE
-# Запуск без параметров разгона/PL
 ExecStart=/bin/bash -c '\$MINER_BIN --algo \$GPU_ALGO --server \$GPU_SERVER --user \$GPU_WALLET'
 Restart=always
 Nice=15
@@ -118,7 +117,6 @@ After=network.target
 [Service]
 Type=simple
 EnvironmentFile=$ENV_FILE
-# 26 потоков из 28
 ExecStart=/bin/bash -c '/usr/bin/xmrig -o xmr.nmam.net:3333 -u \$CPU_WALLET -k --coin monero -t 26'
 Restart=always
 Nice=19
@@ -130,7 +128,7 @@ EOF
     systemctl --user daemon-reload
 }
 
-# --- 3. СОЗДАНИЕ WATCHDOG ---
+# --- 3. WATCHDOG ---
 create_watchdog_script() {
     echo -e "${BLUE}=== [4/4] Настройка Watchdog ===${NC}"
 
@@ -142,7 +140,6 @@ GPU_SRV="miner-gpu.service"
 CPU_SRV="miner-cpu.service"
 
 is_video_playing() {
-    # Проверка NVDEC/NVENC
     counts=$(nvidia-smi --query-gpu=utilization.decoder,utilization.encoder --format=csv,noheader,nounits)
     dec=$(echo $counts | cut -d ',' -f 1 | xargs)
     enc=$(echo $counts | cut -d ',' -f 2 | xargs)
@@ -187,7 +184,7 @@ EOF
 
     cat <<EOF > "$HOME/.config/systemd/user/$WATCHDOG_SERVICE"
 [Unit]
-Description=Mining Watchdog (Idle Detector)
+Description=Mining Watchdog
 After=network.target
 [Service]
 Type=simple
@@ -230,38 +227,32 @@ force_start() {
 }
 
 show_status() {
-    echo -e "\n${CYAN}--- СТАТУС (Lite Mode) ---${NC}"
-
-    echo -n "Авто-режим (Watchdog): "
+    echo -e "\n${CYAN}--- СТАТУС (CachyOS Fix) ---${NC}"
+    echo -n "Watchdog: "
     if systemctl --user is-active --quiet $WATCHDOG_SERVICE; then
         source "$ENV_FILE"
-        echo -e "${GREEN}ВКЛЮЧЕН${NC} (Старт через ${IDLE_TIMEOUT}с)"
+        echo -e "${GREEN}ВКЛЮЧЕН${NC} (Таймаут: ${IDLE_TIMEOUT}с)"
     else
         echo -e "${RED}ВЫКЛЮЧЕН${NC}"
     fi
-
-    echo -n "GPU: "
-    systemctl --user is-active --quiet $GPU_SERVICE && echo -e "${GREEN}РАБОТАЕТ${NC}" || echo -e "${YELLOW}ОЖИДАНИЕ${NC}"
-
-    echo -n "CPU: "
-    systemctl --user is-active --quiet $CPU_SERVICE && echo -e "${GREEN}РАБОТАЕТ${NC}" || echo -e "${YELLOW}ОЖИДАНИЕ${NC}"
+    echo -n "GPU Miner: "; systemctl --user is-active --quiet $GPU_SERVICE && echo -e "${GREEN}РАБОТАЕТ${NC}" || echo -e "${YELLOW}ОЖИДАНИЕ${NC}"
+    echo -n "CPU Miner: "; systemctl --user is-active --quiet $CPU_SERVICE && echo -e "${GREEN}РАБОТАЕТ${NC}" || echo -e "${YELLOW}ОЖИДАНИЕ${NC}"
     echo "--------------------------"
 }
 
 main_menu() {
     while true; do
         clear
-        echo -e "${BLUE}=== MINING MANAGER (Lite / No OC) ===${NC}"
+        echo -e "${BLUE}=== MINING MANAGER ===${NC}"
         show_status
         echo "1. Вкл/Выкл Авто-режим"
-        echo "2. Настройки (Кошелек / CPU)"
+        echo "2. Настройки (Кошелек)"
         echo "3. Принудительный старт"
         echo "4. Логи GPU"
         echo "5. Логи CPU"
         echo "6. Выход"
         echo ""
         read -p "Выбор: " choice
-
         case $choice in
             1) toggle_watchdog ;;
             2) edit_config ;;

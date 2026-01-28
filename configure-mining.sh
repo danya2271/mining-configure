@@ -86,7 +86,7 @@ Type=simple
 EnvironmentFile=$ENV_FILE
 Environment=all_proxy=http://\${PROXY_ADDR}
 Environment=https_proxy=http://\${PROXY_ADDR}
-ExecStart=/opt/gminer/miner --algo \${GPU_ALGO} --server \${GPU_SERVER} --user \${GPU_WALLET}
+ExecStart=/opt/gminer/miner --algo \${GPU_ALGO} --server \${GPU_SERVER} --user \${GPU_WALLET} -p gpu~${GPU_ALGO}
 Restart=always
 Nice=15
 EOF

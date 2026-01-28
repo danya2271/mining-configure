@@ -1,14 +1,12 @@
 #!/bin/bash
 
 # ============================================================
-# MINING MANAGER v8.1 (FIXED EDITION)
-# Оптимизировано для: RTX 4060 + Xeon E5 v3 + CachyOS + Nekoray
-# Исправлено: корректное переключение потоков CPU (Active/Idle)
+# MINING MANAGER v8.2 (AUTO-RELOAD EDITION)
 # ============================================================
 
 CONFIG_DIR="$HOME/.config/mining-manager"
 ENV_FILE="$CONFIG_DIR/mining.env"
-RUNTIME_ENV="$CONFIG_DIR/runtime.env" # Новый файл для динамических переменных
+RUNTIME_ENV="$CONFIG_DIR/runtime.env"
 WATCHDOG_SCRIPT="$CONFIG_DIR/watchdog.sh"
 WATCHDOG_SERVICE="mining-watchdog.service"
 GPU_SERVICE="miner-gpu.service"
@@ -37,15 +35,14 @@ install_deps() {
         [ "$mc" == "2" ] && $AUR -S --needed --noconfirm rigel-bin || $AUR -S --needed --noconfirm gminer-bin
     fi
 
-    # Настройка Huge Pages для Xeon
-    echo -e "${BLUE}Оптимизация Huge Pages для Xeon (нужен sudo)...${NC}"
+    # Настройка Huge Pages
+    echo -e "${BLUE}Оптимизация Huge Pages...${NC}"
     sudo sysctl -w vm.nr_hugepages=1280
     echo "vm.nr_hugepages=1280" | sudo tee /etc/sysctl.d/10-mining.conf > /dev/null
 }
 
 setup_config() {
     mkdir -p "$CONFIG_DIR"
-    # Создаем пустой runtime файл, чтобы systemd не ругался при первом запуске
     touch "$RUNTIME_ENV"
 
     echo -e "${CYAN}=== МАСТЕР НАСТРОЙКИ ===${NC}"
@@ -56,7 +53,6 @@ setup_config() {
     echo "Введите IP:PORT (например, 127.0.0.1:2081)"
     read -p "> " proxy_input
 
-    # Пытаемся определить путь к майнеру
     M_BIN="/usr/bin/gminer"
     [ -f /usr/bin/rigel ] && M_BIN="/usr/bin/rigel"
 
@@ -68,25 +64,23 @@ GPU_WALLET=$gpu_wal
 CPU_WALLET=$cpu_wal
 PROXY_ADDR=$proxy_input
 USE_CPU_MINING=true
+# Ваши настройки:
 CPU_THREADS_IDLE=26
-CPU_THREADS_ACTIVE=2
+CPU_THREADS_ACTIVE=6
 IDLE_TIMEOUT=60
 EOF
-    # Инициализируем runtime значением по умолчанию
-    echo "CURRENT_CPU_THREADS=2" > "$RUNTIME_ENV"
-
-    echo -e "${GREEN}Конфигурация сохранена в $ENV_FILE${NC}"
+    echo "CURRENT_CPU_THREADS=6" > "$RUNTIME_ENV"
+    echo -e "${GREEN}Конфигурация сохранена.${NC}"
 }
 
 create_services() {
-    echo -e "${BLUE}Создание системных служб...${NC}"
+    echo -e "${BLUE}Обновление служб и скриптов...${NC}"
 
     # GPU SERVICE
     cat <<EOF > "$HOME/.config/systemd/user/$GPU_SERVICE"
 [Unit]
 Description=GPU Miner
 After=network.target
-
 [Service]
 Type=simple
 EnvironmentFile=$ENV_FILE
@@ -97,38 +91,33 @@ Nice=15
 EOF
 
     # CPU SERVICE
-    # Исправлено: теперь читает runtime.env ПОСЛЕ основного конфига
     cat <<EOF > "$HOME/.config/systemd/user/$CPU_SERVICE"
 [Unit]
 Description=CPU Miner
 After=network.target
-
 [Service]
 Type=simple
 EnvironmentFile=$ENV_FILE
 EnvironmentFile=$RUNTIME_ENV
-# XMRig явно получает кол-во потоков через переменную.
-# --cpu-no-yield помогает на Xeon при активном использовании ПК
 ExecStart=/usr/bin/xmrig -o xmr-eu1.nanopool.org:14433 -u \${CPU_WALLET} --proxy=\${PROXY_ADDR} --tls -k --coin monero -t \${CURRENT_CPU_THREADS} --cpu-no-yield
 Restart=always
 Nice=19
 EOF
 
-    # WATCHDOG SCRIPT
-    # Исправлено: запись в файл вместо set-environment
+    # WATCHDOG SCRIPT (V8.2 INTELLIGENT)
     cat <<'EOF' > "$WATCHDOG_SCRIPT"
 #!/bin/bash
 CONFIG_DIR="$HOME/.config/mining-manager"
 ENV_FILE="$CONFIG_DIR/mining.env"
 RUNTIME_ENV="$CONFIG_DIR/runtime.env"
-source "$ENV_FILE"
 
 GPU_SRV="miner-gpu.service"
 CPU_SRV="miner-cpu.service"
-last_state="unknown"
+
+# Храним состояние в памяти
+current_mode="unknown" # idle или active
 
 is_video_playing() {
-    # Проверка активности декодера/энкодера NVIDIA
     if command -v nvidia-smi &> /dev/null; then
         counts=$(nvidia-smi --query-gpu=utilization.decoder,utilization.encoder --format=csv,noheader,nounits)
         dec=$(echo $counts | cut -d ',' -f 1 | xargs)
@@ -139,51 +128,55 @@ is_video_playing() {
     fi
 }
 
-update_cpu_threads() {
-    local threads=$1
-    # Проверяем, изменилось ли значение, чтобы не перезапускать зря
-    current=$(grep "CURRENT_CPU_THREADS" "$RUNTIME_ENV" | cut -d'=' -f2)
-    if [ "$current" != "$threads" ]; then
-        echo "CURRENT_CPU_THREADS=$threads" > "$RUNTIME_ENV"
-        [ "$USE_CPU_MINING" = "true" ] && systemctl --user restart $CPU_SRV
-    fi
-}
-
 while true; do
+    # 1. Читаем конфиг на каждом цикле (Hot Reload)
+    source "$ENV_FILE"
+
+    # 2. Определяем, что сейчас происходит
     idle_ms=$(xprintidle)
     idle_sec=$((idle_ms / 1000))
 
     if [ "$idle_sec" -lt "$IDLE_TIMEOUT" ] || is_video_playing; then
-        # === ACTIVE MODE (Я за компом) ===
-        if [ "$last_state" != "active" ]; then
-            # Xeon MSR fix (выключение prefetch для стабильности в играх, опционально)
-            sudo wrmsr -a 0x1a4 0x0 2>/dev/null
-
-            # Останавливаем GPU майнинг
-            systemctl --user stop $GPU_SRV
-
-            # Меняем потоки CPU на 2 (или сколько указано в конфиге)
-            echo "CURRENT_CPU_THREADS=$CPU_THREADS_ACTIVE" > "$RUNTIME_ENV"
-            [ "$USE_CPU_MINING" = "true" ] && systemctl --user restart $CPU_SRV
-
-            last_state="active"
-        fi
+        target_mode="active"
+        target_threads=$CPU_THREADS_ACTIVE
     else
-        # === IDLE MODE (Комп простаивает) ===
-        if [ "$last_state" != "idle" ]; then
-            # Xeon MSR fix (включение prefetch для хэшрейта)
-            sudo wrmsr -a 0x1a4 0xf 2>/dev/null
+        target_mode="idle"
+        target_threads=$CPU_THREADS_IDLE
+    fi
 
-            # Меняем потоки CPU на максимум
-            echo "CURRENT_CPU_THREADS=$CPU_THREADS_IDLE" > "$RUNTIME_ENV"
+    # 3. Читаем, что сейчас запущено по факту
+    running_threads=$(grep "CURRENT_CPU_THREADS" "$RUNTIME_ENV" 2>/dev/null | cut -d'=' -f2)
+
+    # 4. ЛОГИКА ПЕРЕКЛЮЧЕНИЯ
+
+    # Если сменился режим (Active <-> Idle) ИЛИ изменились настройки потоков в конфиге
+    if [ "$current_mode" != "$target_mode" ] || [ "$running_threads" != "$target_threads" ]; then
+
+        echo "Switching to $target_mode (Threads: $target_threads)..."
+
+        if [ "$target_mode" == "active" ]; then
+            # Переход в ACTIVE
+            sudo wrmsr -a 0x1a4 0x0 2>/dev/null # Откл prefetch
+            systemctl --user stop $GPU_SRV      # Стоп GPU
+
+            # Обновляем потоки и рестарт CPU
+            echo "CURRENT_CPU_THREADS=$target_threads" > "$RUNTIME_ENV"
             [ "$USE_CPU_MINING" = "true" ] && systemctl --user restart $CPU_SRV
 
-            # Запускаем GPU майнинг
-            systemctl --user start $GPU_SRV
+        else
+            # Переход в IDLE
+            sudo wrmsr -a 0x1a4 0xf 2>/dev/null # Вкл prefetch
 
-            last_state="idle"
+            # Обновляем потоки и рестарт CPU
+            echo "CURRENT_CPU_THREADS=$target_threads" > "$RUNTIME_ENV"
+            [ "$USE_CPU_MINING" = "true" ] && systemctl --user restart $CPU_SRV
+
+            systemctl --user start $GPU_SRV     # Старт GPU
         fi
+
+        current_mode="$target_mode"
     fi
+
     sleep 5
 done
 EOF
@@ -211,36 +204,34 @@ EOF
 show_status() {
     echo -e "\n${CYAN}--- СТАТУС СИСТЕМЫ ---${NC}"
     source "$ENV_FILE" 2>/dev/null
-    # Читаем текущее кол-во потоков из runtime файла
     cur_threads=$(grep "CURRENT_CPU_THREADS" "$RUNTIME_ENV" 2>/dev/null | cut -d'=' -f2)
 
-    echo -e "Прокси: ${YELLOW}${PROXY_ADDR:-НЕТ}${NC}"
-    echo -e "Потоки CPU сейчас: ${YELLOW}${cur_threads:-UNKNOWN}${NC} (Active: $CPU_THREADS_ACTIVE / Idle: $CPU_THREADS_IDLE)"
+    echo -e "Режим потоков: ${YELLOW}${cur_threads:-ЗАГРУЗКА}${NC} (В конфиге Active=$CPU_THREADS_ACTIVE / Idle=$CPU_THREADS_IDLE)"
 
     echo -n "Watchdog: "; systemctl --user is-active --quiet $WATCHDOG_SERVICE && echo -e "${GREEN}РАБОТАЕТ${NC}" || echo -e "${RED}ВЫКЛ${NC}"
-    echo -n "GPU: "; systemctl --user is-active --quiet $GPU_SERVICE && echo -e "${GREEN}РАБОТАЕТ${NC}" || echo -e "${YELLOW}ОЖИДАНИЕ${NC}"
-    echo -n "CPU: "; systemctl --user is-active --quiet $CPU_SERVICE && echo -e "${GREEN}РАБОТАЕТ${NC}" || echo -e "${YELLOW}ОЖИДАНИЕ${NC}"
+    echo -n "GPU: "; systemctl --user is-active --quiet $GPU_SERVICE && echo -e "${GREEN}РАБОТАЕТ${NC}" || echo -e "${YELLOW}СПИТ${NC}"
+    echo -n "CPU: "; systemctl --user is-active --quiet $CPU_SERVICE && echo -e "${GREEN}РАБОТАЕТ${NC}" || echo -e "${YELLOW}СПИТ${NC}"
     echo "----------------------"
 }
 
 main_menu() {
     while true; do
         clear
-        echo -e "${BLUE}=== MINING MANAGER v8.1 (FIXED) ===${NC}"
+        echo -e "${BLUE}=== MINING MANAGER v8.2 (AUTO-RELOAD) ===${NC}"
         show_status
-        echo "1. Вкл/Выкл Автоматику"
-        echo "2. Изменить настройки (Кошельки, Прокси, Потоки)"
-        echo "3. Сбросить всё и ПЕРЕУСТАНОВИТЬ"
+        echo "1. Вкл/Выкл Все службы"
+        echo "2. Изменить конфиг (применится автоматически)"
+        echo "3. Сбросить всё и ПЕРЕУСТАНОВИТЬ (ВАЖНО ДЛЯ ОБНОВЛЕНИЯ)"
         echo "4. Логи: Процессор"
         echo "5. Логи: Видеокарта"
-        echo "6. Логи: Контроллер (Watchdog)"
+        echo "6. Логи: Watchdog"
         echo "7. Выход"
         echo ""
         read -p "> " choice
         case $choice in
             1) systemctl --user is-active --quiet $WATCHDOG_SERVICE && systemctl --user stop $WATCHDOG_SERVICE $GPU_SERVICE $CPU_SERVICE || systemctl --user start $WATCHDOG_SERVICE ;;
-            2) nano "$ENV_FILE" && systemctl --user restart $WATCHDOG_SERVICE ;;
-            3) rm -rf "$CONFIG_DIR"; echo "Конфиг удален. Перезапустите скрипт."; exit 0 ;;
+            2) nano "$ENV_FILE" ;; # Больше не нужно рестартить руками
+            3) rm -rf "$CONFIG_DIR"; echo "Конфиг сброшен. Перезапустите скрипт."; exit 0 ;;
             4) journalctl --user -f -u $CPU_SERVICE ;;
             5) journalctl --user -f -u $GPU_SERVICE ;;
             6) journalctl --user -f -u $WATCHDOG_SERVICE ;;
@@ -249,7 +240,6 @@ main_menu() {
     done
 }
 
-# Запуск
 if [ ! -f "$ENV_FILE" ]; then
     install_deps
     setup_config

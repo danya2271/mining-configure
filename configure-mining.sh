@@ -20,12 +20,14 @@ YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
+mkdir "$HOME/.config/systemd/user" -p
+
 # --- 1. СИСТЕМНЫЕ ФУНКЦИИ ---
 
 install_deps() {
     echo -e "${BLUE}Установка системных компонентов...${NC}"
     if command -v yay &> /dev/null; then AUR="yay"; elif command -v paru &> /dev/null; then AUR="paru"; else echo "Нужен AUR хелпер!"; exit 1; fi
-    sudo pacman -S --needed --noconfirm cuda gamemode xmrig git base-devel xprintidle
+    sudo pacman -S --needed cuda gamemode xmrig git base-devel xprintidle
 
     if [ ! -f /usr/bin/gminer ] && [ ! -f /usr/bin/rigel ]; then
         echo -e "${CYAN}Выберите майнер для GPU:${NC}"

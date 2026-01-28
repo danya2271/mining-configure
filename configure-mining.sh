@@ -1,12 +1,14 @@
 #!/bin/bash
 
 # ============================================================
-# MINING MANAGER v8 (ULTIMATE EDITION)
+# MINING MANAGER v8.1 (FIXED EDITION)
 # Оптимизировано для: RTX 4060 + Xeon E5 v3 + CachyOS + Nekoray
+# Исправлено: корректное переключение потоков CPU (Active/Idle)
 # ============================================================
 
 CONFIG_DIR="$HOME/.config/mining-manager"
 ENV_FILE="$CONFIG_DIR/mining.env"
+RUNTIME_ENV="$CONFIG_DIR/runtime.env" # Новый файл для динамических переменных
 WATCHDOG_SCRIPT="$CONFIG_DIR/watchdog.sh"
 WATCHDOG_SERVICE="mining-watchdog.service"
 GPU_SERVICE="miner-gpu.service"
@@ -43,12 +45,15 @@ install_deps() {
 
 setup_config() {
     mkdir -p "$CONFIG_DIR"
+    # Создаем пустой runtime файл, чтобы systemd не ругался при первом запуске
+    touch "$RUNTIME_ENV"
+
     echo -e "${CYAN}=== МАСТЕР НАСТРОЙКИ ===${NC}"
 
     read -p "Кошелек GPU (Ravencoin): " gpu_wal
     read -p "Кошелек CPU (Monero): " cpu_wal
     echo -e "${YELLOW}Настройка Прокси (Nekoray):${NC}"
-    echo "Введите IP:PORT (например, 127.0.0.1:2081 для HTTP или 127.0.0.1:2080 для SOCKS)"
+    echo "Введите IP:PORT (например, 127.0.0.1:2081)"
     read -p "> " proxy_input
 
     # Пытаемся определить путь к майнеру
@@ -64,9 +69,12 @@ CPU_WALLET=$cpu_wal
 PROXY_ADDR=$proxy_input
 USE_CPU_MINING=true
 CPU_THREADS_IDLE=26
-CPU_THREADS_ACTIVE=4
+CPU_THREADS_ACTIVE=2
 IDLE_TIMEOUT=60
 EOF
+    # Инициализируем runtime значением по умолчанию
+    echo "CURRENT_CPU_THREADS=2" > "$RUNTIME_ENV"
+
     echo -e "${GREEN}Конфигурация сохранена в $ENV_FILE${NC}"
 }
 
@@ -82,15 +90,14 @@ After=network.target
 [Service]
 Type=simple
 EnvironmentFile=$ENV_FILE
-# Авто-определение типа прокси для переменных окружения
 Environment=all_proxy=http://\${PROXY_ADDR}
-# Запуск через SSL порт (3443 для Flypool)
 ExecStart=\${MINER_BIN} --algo \${GPU_ALGO} --server \${GPU_SERVER} --user \${GPU_WALLET} --proxy \${PROXY_ADDR} --ssl 1
 Restart=always
 Nice=15
 EOF
 
     # CPU SERVICE
+    # Исправлено: теперь читает runtime.env ПОСЛЕ основного конфига
     cat <<EOF > "$HOME/.config/systemd/user/$CPU_SERVICE"
 [Unit]
 Description=CPU Miner
@@ -99,25 +106,47 @@ After=network.target
 [Service]
 Type=simple
 EnvironmentFile=$ENV_FILE
-# XMRig через TLS + Proxy
-ExecStart=/usr/bin/xmrig -o xmr-eu1.nanopool.org:14433 -u \${CPU_WALLET} --proxy=\${PROXY_ADDR} --tls -k --coin monero -t \${CURRENT_CPU_THREADS:-4}
+EnvironmentFile=$RUNTIME_ENV
+# XMRig явно получает кол-во потоков через переменную.
+# --cpu-no-yield помогает на Xeon при активном использовании ПК
+ExecStart=/usr/bin/xmrig -o xmr-eu1.nanopool.org:14433 -u \${CPU_WALLET} --proxy=\${PROXY_ADDR} --tls -k --coin monero -t \${CURRENT_CPU_THREADS} --cpu-no-yield
 Restart=always
 Nice=19
 EOF
 
     # WATCHDOG SCRIPT
+    # Исправлено: запись в файл вместо set-environment
     cat <<'EOF' > "$WATCHDOG_SCRIPT"
 #!/bin/bash
-source "$HOME/.config/mining-manager/mining.env"
+CONFIG_DIR="$HOME/.config/mining-manager"
+ENV_FILE="$CONFIG_DIR/mining.env"
+RUNTIME_ENV="$CONFIG_DIR/runtime.env"
+source "$ENV_FILE"
+
 GPU_SRV="miner-gpu.service"
 CPU_SRV="miner-cpu.service"
 last_state="unknown"
 
 is_video_playing() {
-    counts=$(nvidia-smi --query-gpu=utilization.decoder,utilization.encoder --format=csv,noheader,nounits)
-    dec=$(echo $counts | cut -d ',' -f 1 | xargs)
-    enc=$(echo $counts | cut -d ',' -f 2 | xargs)
-    if [ "$dec" -gt 0 ] || [ "$enc" -gt 0 ]; then return 0; else return 1; fi
+    # Проверка активности декодера/энкодера NVIDIA
+    if command -v nvidia-smi &> /dev/null; then
+        counts=$(nvidia-smi --query-gpu=utilization.decoder,utilization.encoder --format=csv,noheader,nounits)
+        dec=$(echo $counts | cut -d ',' -f 1 | xargs)
+        enc=$(echo $counts | cut -d ',' -f 2 | xargs)
+        if [ "$dec" -gt 0 ] || [ "$enc" -gt 0 ]; then return 0; else return 1; fi
+    else
+        return 1
+    fi
+}
+
+update_cpu_threads() {
+    local threads=$1
+    # Проверяем, изменилось ли значение, чтобы не перезапускать зря
+    current=$(grep "CURRENT_CPU_THREADS" "$RUNTIME_ENV" | cut -d'=' -f2)
+    if [ "$current" != "$threads" ]; then
+        echo "CURRENT_CPU_THREADS=$threads" > "$RUNTIME_ENV"
+        [ "$USE_CPU_MINING" = "true" ] && systemctl --user restart $CPU_SRV
+    fi
 }
 
 while true; do
@@ -125,19 +154,33 @@ while true; do
     idle_sec=$((idle_ms / 1000))
 
     if [ "$idle_sec" -lt "$IDLE_TIMEOUT" ] || is_video_playing; then
+        # === ACTIVE MODE (Я за компом) ===
         if [ "$last_state" != "active" ]; then
-            sudo wrmsr -a 0x1a4 0x0
-            systemctl --user set-environment CURRENT_CPU_THREADS=$CPU_THREADS_ACTIVE
+            # Xeon MSR fix (выключение prefetch для стабильности в играх, опционально)
+            sudo wrmsr -a 0x1a4 0x0 2>/dev/null
+
+            # Останавливаем GPU майнинг
             systemctl --user stop $GPU_SRV
+
+            # Меняем потоки CPU на 2 (или сколько указано в конфиге)
+            echo "CURRENT_CPU_THREADS=$CPU_THREADS_ACTIVE" > "$RUNTIME_ENV"
             [ "$USE_CPU_MINING" = "true" ] && systemctl --user restart $CPU_SRV
+
             last_state="active"
         fi
     else
+        # === IDLE MODE (Комп простаивает) ===
         if [ "$last_state" != "idle" ]; then
-            sudo wrmsr -a 0x1a4 0xf
-            systemctl --user set-environment CURRENT_CPU_THREADS=$CPU_THREADS_IDLE
-            systemctl --user start $GPU_SRV
+            # Xeon MSR fix (включение prefetch для хэшрейта)
+            sudo wrmsr -a 0x1a4 0xf 2>/dev/null
+
+            # Меняем потоки CPU на максимум
+            echo "CURRENT_CPU_THREADS=$CPU_THREADS_IDLE" > "$RUNTIME_ENV"
             [ "$USE_CPU_MINING" = "true" ] && systemctl --user restart $CPU_SRV
+
+            # Запускаем GPU майнинг
+            systemctl --user start $GPU_SRV
+
             last_state="idle"
         fi
     fi
@@ -168,9 +211,11 @@ EOF
 show_status() {
     echo -e "\n${CYAN}--- СТАТУС СИСТЕМЫ ---${NC}"
     source "$ENV_FILE" 2>/dev/null
+    # Читаем текущее кол-во потоков из runtime файла
+    cur_threads=$(grep "CURRENT_CPU_THREADS" "$RUNTIME_ENV" 2>/dev/null | cut -d'=' -f2)
+
     echo -e "Прокси: ${YELLOW}${PROXY_ADDR:-НЕТ}${NC}"
-    hp_status=$(sysctl -n vm.nr_hugepages)
-    echo -e "Huge Pages: ${YELLOW}${hp_status}${NC} (должно быть 1280)"
+    echo -e "Потоки CPU сейчас: ${YELLOW}${cur_threads:-UNKNOWN}${NC} (Active: $CPU_THREADS_ACTIVE / Idle: $CPU_THREADS_IDLE)"
 
     echo -n "Watchdog: "; systemctl --user is-active --quiet $WATCHDOG_SERVICE && echo -e "${GREEN}РАБОТАЕТ${NC}" || echo -e "${RED}ВЫКЛ${NC}"
     echo -n "GPU: "; systemctl --user is-active --quiet $GPU_SERVICE && echo -e "${GREEN}РАБОТАЕТ${NC}" || echo -e "${YELLOW}ОЖИДАНИЕ${NC}"
@@ -181,7 +226,7 @@ show_status() {
 main_menu() {
     while true; do
         clear
-        echo -e "${BLUE}=== MINING MANAGER v8 (ULTIMATE) ===${NC}"
+        echo -e "${BLUE}=== MINING MANAGER v8.1 (FIXED) ===${NC}"
         show_status
         echo "1. Вкл/Выкл Автоматику"
         echo "2. Изменить настройки (Кошельки, Прокси, Потоки)"

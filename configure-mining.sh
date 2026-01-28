@@ -59,7 +59,7 @@ setup_config() {
     cat <<EOF > "$ENV_FILE"
 MINER_BIN=$M_BIN
 GPU_ALGO=kawpow
-GPU_SERVER=ravencoin.flypool.org:3443
+GPU_SERVER=de.ravencoin.herominers.com:1140
 GPU_WALLET=$gpu_wal
 CPU_WALLET=$cpu_wal
 PROXY_ADDR=$proxy_input
@@ -114,8 +114,17 @@ RUNTIME_ENV="$CONFIG_DIR/runtime.env"
 GPU_SRV="miner-gpu.service"
 CPU_SRV="miner-cpu.service"
 
-# Храним состояние в памяти
-current_mode="unknown" # idle или active
+# Внутренний таймер простоя (так как система нам его не дает)
+MY_IDLE_TIMER=0
+LAST_INT_COUNT=0
+LOOP_DELAY=5
+
+# === ФУНКЦИЯ ЧТЕНИЯ АКТИВНОСТИ ЖЕЛЕЗА ===
+get_hardware_interrupts() {
+    # Складываем количество прерываний от USB (xhci) и клавиатуры/тачпада (i8042)
+    # Это работает на уровне ядра, игнорируя Wayland
+    grep -E "xhci|i8042" /proc/interrupts | awk '{ for(i=2;i<=NF;i++) sum+=$i } END { print sum }'
+}
 
 is_video_playing() {
     if command -v nvidia-smi &> /dev/null; then
@@ -128,15 +137,34 @@ is_video_playing() {
     fi
 }
 
+# Инициализация первого значения
+LAST_INT_COUNT=$(get_hardware_interrupts)
+current_mode="unknown"
+
+echo "Watchdog started. Mode: KERNEL HARDWARE MONITOR (Universal)"
+
 while true; do
-    # 1. Читаем конфиг на каждом цикле (Hot Reload)
-    source "$ENV_FILE"
+    source "$ENV_FILE" 2>/dev/null
 
-    # 2. Определяем, что сейчас происходит
-    idle_ms=$(xprintidle)
-    idle_sec=$((idle_ms / 1000))
+    # 1. Получаем текущее число прерываний (кликов/движений)
+    CURRENT_INT_COUNT=$(get_hardware_interrupts)
 
-    if [ "$idle_sec" -lt "$IDLE_TIMEOUT" ] || is_video_playing; then
+    # 2. Вычисляем разницу с прошлого раза
+    DIFF=$((CURRENT_INT_COUNT - LAST_INT_COUNT))
+
+    # Если было много прерываний (>100), значит юзер шевелил мышкой/клавой
+    if [ "$DIFF" -gt 100 ]; then
+        MY_IDLE_TIMER=0
+    else
+        # Иначе добавляем время к таймеру
+        MY_IDLE_TIMER=$((MY_IDLE_TIMER + LOOP_DELAY))
+    fi
+
+    # Обновляем "прошлое" значение
+    LAST_INT_COUNT=$CURRENT_INT_COUNT
+
+    # 3. Логика переключения
+    if [ "$MY_IDLE_TIMER" -lt "$IDLE_TIMEOUT" ] || is_video_playing; then
         target_mode="active"
         target_threads=$CPU_THREADS_ACTIVE
     else
@@ -144,40 +172,34 @@ while true; do
         target_threads=$CPU_THREADS_IDLE
     fi
 
-    # 3. Читаем, что сейчас запущено по факту
+    # 4. Применение
     running_threads=$(grep "CURRENT_CPU_THREADS" "$RUNTIME_ENV" 2>/dev/null | cut -d'=' -f2)
 
-    # 4. ЛОГИКА ПЕРЕКЛЮЧЕНИЯ
-
-    # Если сменился режим (Active <-> Idle) ИЛИ изменились настройки потоков в конфиге
     if [ "$current_mode" != "$target_mode" ] || [ "$running_threads" != "$target_threads" ]; then
 
-        echo "Switching to $target_mode (Threads: $target_threads)..."
+        echo "State change: $target_mode (Idle Timer: ${MY_IDLE_TIMER}s | Interrupts: +$DIFF)"
 
         if [ "$target_mode" == "active" ]; then
-            # Переход в ACTIVE
-            sudo wrmsr -a 0x1a4 0x0 2>/dev/null # Откл prefetch
-            systemctl --user stop $GPU_SRV      # Стоп GPU
+            # --> ACTIVE
+            sudo wrmsr -a 0x1a4 0x0 2>/dev/null
+            systemctl --user stop $GPU_SRV
 
-            # Обновляем потоки и рестарт CPU
             echo "CURRENT_CPU_THREADS=$target_threads" > "$RUNTIME_ENV"
             [ "$USE_CPU_MINING" = "true" ] && systemctl --user restart $CPU_SRV
 
         else
-            # Переход в IDLE
-            sudo wrmsr -a 0x1a4 0xf 2>/dev/null # Вкл prefetch
+            # --> IDLE
+            sudo wrmsr -a 0x1a4 0xf 2>/dev/null
 
-            # Обновляем потоки и рестарт CPU
             echo "CURRENT_CPU_THREADS=$target_threads" > "$RUNTIME_ENV"
             [ "$USE_CPU_MINING" = "true" ] && systemctl --user restart $CPU_SRV
 
-            systemctl --user start $GPU_SRV     # Старт GPU
+            systemctl --user start $GPU_SRV
         fi
-
         current_mode="$target_mode"
     fi
 
-    sleep 5
+    sleep $LOOP_DELAY
 done
 EOF
     chmod +x "$WATCHDOG_SCRIPT"

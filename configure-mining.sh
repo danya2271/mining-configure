@@ -53,14 +53,14 @@ setup_config() {
     echo "Введите IP:PORT (например, 127.0.0.1:2081)"
     read -p "> " proxy_input
 
-    M_BIN="/usr/bin/gminer"
+    M_BIN="/opt/gminer/miner"
     [ -f /usr/bin/rigel ] && M_BIN="/usr/bin/rigel"
 
     cat <<EOF > "$ENV_FILE"
 MINER_BIN=$M_BIN
 GPU_ALGO=kawpow
-GPU_SERVER=de.ravencoin.herominers.com:1140
-GPU_WALLET=$gpu_wal
+GPU_SERVER=gulf.moneroocean.stream:10128
+GPU_WALLET=$cpu_wal
 CPU_WALLET=$cpu_wal
 PROXY_ADDR=$proxy_input
 USE_CPU_MINING=true
@@ -85,7 +85,8 @@ After=network.target
 Type=simple
 EnvironmentFile=$ENV_FILE
 Environment=all_proxy=http://\${PROXY_ADDR}
-ExecStart=\${MINER_BIN} --algo \${GPU_ALGO} --server \${GPU_SERVER} --user \${GPU_WALLET} --proxy \${PROXY_ADDR} --ssl 1
+Environment=https_proxy=http://\${PROXY_ADDR}
+ExecStart=/opt/gminer/miner --algo \${GPU_ALGO} --server \${GPU_SERVER} --user \${GPU_WALLET}
 Restart=always
 Nice=15
 EOF

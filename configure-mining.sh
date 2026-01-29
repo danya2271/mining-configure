@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ============================================================
-# MINING MANAGER v8.3 (GMER ONLY + CUSTOM NAMES)
+# MINING MANAGER v8.4 (Toggle GPU Feature)
 # ============================================================
 
 CONFIG_DIR="$HOME/.config/mining-manager"
@@ -31,7 +31,7 @@ install_deps() {
     # Update system and install common deps
     sudo pacman -S --needed cuda gamemode xmrig git base-devel xprintidle
 
-    # Force install Gminer if not present
+    # Force install Gminer if not present (Installs binaries regardless of config, just in case)
     if [ ! -f /usr/bin/gminer ] && [ ! -f /opt/gminer/miner ]; then
         echo -e "${CYAN}Installing Gminer...${NC}"
         $AUR -S --needed --noconfirm gminer-bin
@@ -49,16 +49,30 @@ setup_config() {
 
     echo -e "${CYAN}=== SETUP WIZARD ===${NC}"
 
-    # Wallet Setup
-    read -p "GPU Wallet (Ravencoin/Kawpow): " gpu_wal
-    read -p "GPU Worker Name (e.g. MyGamingPC-GPU): " gpu_worker
+    # --- GPU SETUP ---
+    echo -e "${YELLOW}GPU Configuration:${NC}"
+    read -p "Enable GPU Mining? (y/n): " use_gpu_response
+    if [[ "$use_gpu_response" =~ ^[Yy]$ ]]; then
+        USE_GPU_VAL="true"
+        read -p "GPU Wallet (Ravencoin/Kawpow): " gpu_wal
+        read -p "GPU Worker Name (e.g. MyGamingPC-GPU): " gpu_worker
+    else
+        USE_GPU_VAL="false"
+        gpu_wal="DISABLED"
+        gpu_worker="DISABLED"
+        echo -e "${RED}GPU Mining Disabled.${NC}"
+    fi
+    echo ""
 
+    # --- CPU SETUP ---
+    echo -e "${YELLOW}CPU Configuration:${NC}"
     read -p "CPU Wallet (Monero/XMR): " cpu_wal
     read -p "CPU Worker Name (e.g. MyGamingPC-CPU): " cpu_worker
+    echo ""
 
-    # Proxy Setup
+    # --- PROXY SETUP ---
     echo -e "${YELLOW}Proxy Setup (Nekoray/SOCKS5):${NC}"
-    echo "Enter IP:PORT (e.g., 127.0.0.1:2081)"
+    echo "Enter IP:PORT (e.g., 127.0.0.1:2081) or leave empty for none"
     read -p "> " proxy_input
 
     # Detect Gminer Path
@@ -79,6 +93,7 @@ CPU_WALLET=$cpu_wal
 CPU_WORKER=${cpu_worker:-DefaultCPU}
 PROXY_ADDR=$proxy_input
 USE_CPU_MINING=true
+USE_GPU_MINING=$USE_GPU_VAL
 # Threads Configuration:
 CPU_THREADS_IDLE=26
 CPU_THREADS_ACTIVE=6
@@ -92,7 +107,7 @@ create_services() {
     echo -e "${BLUE}Updating services and scripts...${NC}"
 
     # GPU SERVICE (Gminer Only)
-    # Uses --worker to set the rig name
+    # Service file is always created, but Watchdog controls if it starts
     cat <<EOF > "$HOME/.config/systemd/user/$GPU_SERVICE"
 [Unit]
 Description=GPU Miner (Gminer)
@@ -108,7 +123,6 @@ Nice=15
 EOF
 
     # CPU SERVICE (XMRig)
-    # Uses --rig-id and -p (pass) to ensure name shows on pool
     cat <<EOF > "$HOME/.config/systemd/user/$CPU_SERVICE"
 [Unit]
 Description=CPU Miner (XMRig)
@@ -122,7 +136,7 @@ Restart=always
 Nice=19
 EOF
 
-    # WATCHDOG SCRIPT (UNCHANGED LOGIC)
+    # WATCHDOG SCRIPT
     cat <<'EOF' > "$WATCHDOG_SCRIPT"
 #!/bin/bash
 CONFIG_DIR="$HOME/.config/mining-manager"
@@ -185,21 +199,28 @@ while true; do
         echo "State change: $target_mode (Idle Timer: ${MY_IDLE_TIMER}s | Interrupts: +$DIFF)"
 
         if [ "$target_mode" == "active" ]; then
-            # --> ACTIVE
+            # --> ACTIVE (Gaming/Work)
             sudo wrmsr -a 0x1a4 0x0 2>/dev/null
+
+            # Stop GPU miner regardless of setting
             systemctl --user stop $GPU_SRV
 
             echo "CURRENT_CPU_THREADS=$target_threads" > "$RUNTIME_ENV"
             [ "$USE_CPU_MINING" = "true" ] && systemctl --user restart $CPU_SRV
 
         else
-            # --> IDLE
+            # --> IDLE (Away)
             sudo wrmsr -a 0x1a4 0xf 2>/dev/null
 
             echo "CURRENT_CPU_THREADS=$target_threads" > "$RUNTIME_ENV"
             [ "$USE_CPU_MINING" = "true" ] && systemctl --user restart $CPU_SRV
 
-            systemctl --user start $GPU_SRV
+            # Only start GPU miner if enabled in config
+            if [ "$USE_GPU_MINING" = "true" ]; then
+                systemctl --user start $GPU_SRV
+            else
+                systemctl --user stop $GPU_SRV
+            fi
         fi
         current_mode="$target_mode"
     fi
@@ -234,22 +255,35 @@ show_status() {
     cur_threads=$(grep "CURRENT_CPU_THREADS" "$RUNTIME_ENV" 2>/dev/null | cut -d'=' -f2)
 
     echo -e "CPU Threads: ${YELLOW}${cur_threads:-LOADING}${NC} (Active=$CPU_THREADS_ACTIVE / Idle=$CPU_THREADS_IDLE)"
-    echo -e "Workers: GPU=[${CYAN}$GPU_WORKER${NC}] CPU=[${CYAN}$CPU_WORKER${NC}]"
 
-    echo -n "Watchdog: "; systemctl --user is-active --quiet $WATCHDOG_SERVICE && echo -e "${GREEN}RUNNING${NC}" || echo -e "${RED}OFF${NC}"
-    echo -n "GPU: "; systemctl --user is-active --quiet $GPU_SERVICE && echo -e "${GREEN}MINING${NC}" || echo -e "${YELLOW}SLEEPING${NC}"
-    echo -n "CPU: "; systemctl --user is-active --quiet $CPU_SERVICE && echo -e "${GREEN}MINING${NC}" || echo -e "${YELLOW}SLEEPING${NC}"
+    # Display GPU status based on config
+    if [ "$USE_GPU_MINING" = "true" ]; then
+        echo -e "GPU Config:  ${GREEN}ENABLED${NC} (Worker: $GPU_WORKER)"
+    else
+        echo -e "GPU Config:  ${RED}DISABLED${NC}"
+    fi
+
+    echo -n "Watchdog:    "; systemctl --user is-active --quiet $WATCHDOG_SERVICE && echo -e "${GREEN}RUNNING${NC}" || echo -e "${RED}OFF${NC}"
+
+    echo -n "GPU Miner:   "
+    if [ "$USE_GPU_MINING" = "true" ]; then
+        systemctl --user is-active --quiet $GPU_SERVICE && echo -e "${GREEN}MINING${NC}" || echo -e "${YELLOW}SLEEPING${NC}"
+    else
+        echo -e "${RED}DISABLED${NC}"
+    fi
+
+    echo -n "CPU Miner:   "; systemctl --user is-active --quiet $CPU_SERVICE && echo -e "${GREEN}MINING${NC}" || echo -e "${YELLOW}SLEEPING${NC}"
     echo "----------------------"
 }
 
 main_menu() {
     while true; do
         clear
-        echo -e "${BLUE}=== MINING MANAGER v8.3 (GMiner Only) ===${NC}"
+        echo -e "${BLUE}=== MINING MANAGER v8.4 (GPU Toggle) ===${NC}"
         show_status
         echo "1. Toggle All Services (On/Off)"
-        echo "2. Edit Config (Names/Wallets)"
-        echo "3. RESET & REINSTALL (Use this to apply name changes)"
+        echo "2. Edit Config (Names/Wallets/Threads)"
+        echo "3. RESET & REINSTALL (Change GPU Setting)"
         echo "4. Logs: CPU"
         echo "5. Logs: GPU"
         echo "6. Logs: Watchdog"
@@ -259,7 +293,7 @@ main_menu() {
         case $choice in
             1) systemctl --user is-active --quiet $WATCHDOG_SERVICE && systemctl --user stop $WATCHDOG_SERVICE $GPU_SERVICE $CPU_SERVICE || systemctl --user start $WATCHDOG_SERVICE ;;
             2) nano "$ENV_FILE" ;;
-            3) rm -rf "$CONFIG_DIR"; echo "Config deleted. Please restart script to reconfigure."; exit 0 ;;
+            3) rm -rf "$CONFIG_DIR"; echo "Config deleted. Restarting setup..."; sleep 1; install_deps; setup_config; create_services ;;
             4) journalctl --user -f -u $CPU_SERVICE ;;
             5) journalctl --user -f -u $GPU_SERVICE ;;
             6) journalctl --user -f -u $WATCHDOG_SERVICE ;;

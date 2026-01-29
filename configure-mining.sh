@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ============================================================
-# MINING MANAGER v8.2 (AUTO-RELOAD EDITION)
+# MINING MANAGER v8.3 (GMER ONLY + CUSTOM NAMES)
 # ============================================================
 
 CONFIG_DIR="$HOME/.config/mining-manager"
@@ -12,7 +12,7 @@ WATCHDOG_SERVICE="mining-watchdog.service"
 GPU_SERVICE="miner-gpu.service"
 CPU_SERVICE="miner-cpu.service"
 
-# Цвета
+# Colors
 GREEN='\033[0;32m'
 BLUE='\033[0;34m'
 RED='\033[0;31m'
@@ -22,23 +22,23 @@ NC='\033[0m'
 
 mkdir "$HOME/.config/systemd/user" -p
 
-# --- 1. СИСТЕМНЫЕ ФУНКЦИИ ---
+# --- 1. SYSTEM FUNCTIONS ---
 
 install_deps() {
-    echo -e "${BLUE}Установка системных компонентов...${NC}"
-    if command -v yay &> /dev/null; then AUR="yay"; elif command -v paru &> /dev/null; then AUR="paru"; else echo "Нужен AUR хелпер!"; exit 1; fi
+    echo -e "${BLUE}Installing system components...${NC}"
+    if command -v yay &> /dev/null; then AUR="yay"; elif command -v paru &> /dev/null; then AUR="paru"; else echo "AUR helper needed (yay or paru)!"; exit 1; fi
+
+    # Update system and install common deps
     sudo pacman -S --needed cuda gamemode xmrig git base-devel xprintidle
 
-    if [ ! -f /usr/bin/gminer ] && [ ! -f /usr/bin/rigel ]; then
-        echo -e "${CYAN}Выберите майнер для GPU:${NC}"
-        echo "1) Gminer (Рекомендуется для RVN)"
-        echo "2) Rigel"
-        read -p "> " mc
-        [ "$mc" == "2" ] && $AUR -S --needed --noconfirm rigel-bin || $AUR -S --needed --noconfirm gminer-bin
+    # Force install Gminer if not present
+    if [ ! -f /usr/bin/gminer ] && [ ! -f /opt/gminer/miner ]; then
+        echo -e "${CYAN}Installing Gminer...${NC}"
+        $AUR -S --needed --noconfirm gminer-bin
     fi
 
-    # Настройка Huge Pages
-    echo -e "${BLUE}Оптимизация Huge Pages...${NC}"
+    # Setup Huge Pages
+    echo -e "${BLUE}Optimizing Huge Pages...${NC}"
     sudo sysctl -w vm.nr_hugepages=1280
     echo "vm.nr_hugepages=1280" | sudo tee /etc/sysctl.d/10-mining.conf > /dev/null
 }
@@ -47,67 +47,82 @@ setup_config() {
     mkdir -p "$CONFIG_DIR"
     touch "$RUNTIME_ENV"
 
-    echo -e "${CYAN}=== МАСТЕР НАСТРОЙКИ ===${NC}"
+    echo -e "${CYAN}=== SETUP WIZARD ===${NC}"
 
-    read -p "Кошелек GPU (Ravencoin): " gpu_wal
-    read -p "Кошелек CPU (Monero): " cpu_wal
-    echo -e "${YELLOW}Настройка Прокси (Nekoray):${NC}"
-    echo "Введите IP:PORT (например, 127.0.0.1:2081)"
+    # Wallet Setup
+    read -p "GPU Wallet (Ravencoin/Kawpow): " gpu_wal
+    read -p "GPU Worker Name (e.g. MyGamingPC-GPU): " gpu_worker
+
+    read -p "CPU Wallet (Monero/XMR): " cpu_wal
+    read -p "CPU Worker Name (e.g. MyGamingPC-CPU): " cpu_worker
+
+    # Proxy Setup
+    echo -e "${YELLOW}Proxy Setup (Nekoray/SOCKS5):${NC}"
+    echo "Enter IP:PORT (e.g., 127.0.0.1:2081)"
     read -p "> " proxy_input
 
-    M_BIN="/opt/gminer/miner"
-    [ -f /usr/bin/rigel ] && M_BIN="/usr/bin/rigel"
+    # Detect Gminer Path
+    if [ -f /usr/bin/gminer ]; then
+        M_BIN="/usr/bin/gminer"
+    else
+        M_BIN="/opt/gminer/miner"
+    fi
 
+    # Write Config
     cat <<EOF > "$ENV_FILE"
 MINER_BIN=$M_BIN
 GPU_ALGO=kawpow
 GPU_SERVER=gulf.moneroocean.stream:10128
-GPU_WALLET=$cpu_wal
+GPU_WALLET=$gpu_wal
+GPU_WORKER=${gpu_worker:-DefaultGPU}
 CPU_WALLET=$cpu_wal
+CPU_WORKER=${cpu_worker:-DefaultCPU}
 PROXY_ADDR=$proxy_input
 USE_CPU_MINING=true
-# Ваши настройки:
+# Threads Configuration:
 CPU_THREADS_IDLE=26
 CPU_THREADS_ACTIVE=6
 IDLE_TIMEOUT=60
 EOF
     echo "CURRENT_CPU_THREADS=6" > "$RUNTIME_ENV"
-    echo -e "${GREEN}Конфигурация сохранена.${NC}"
+    echo -e "${GREEN}Configuration saved.${NC}"
 }
 
 create_services() {
-    echo -e "${BLUE}Обновление служб и скриптов...${NC}"
+    echo -e "${BLUE}Updating services and scripts...${NC}"
 
-    # GPU SERVICE
+    # GPU SERVICE (Gminer Only)
+    # Uses --worker to set the rig name
     cat <<EOF > "$HOME/.config/systemd/user/$GPU_SERVICE"
 [Unit]
-Description=GPU Miner
+Description=GPU Miner (Gminer)
 After=network.target
 [Service]
 Type=simple
 EnvironmentFile=$ENV_FILE
 Environment=all_proxy=http://\${PROXY_ADDR}
 Environment=https_proxy=http://\${PROXY_ADDR}
-ExecStart=/opt/gminer/miner --algo \${GPU_ALGO} --server \${GPU_SERVER} --user \${GPU_WALLET} -p gpu~${GPU_ALGO}
+ExecStart=\${MINER_BIN} --algo \${GPU_ALGO} --server \${GPU_SERVER} --user \${GPU_WALLET} --worker \${GPU_WORKER}
 Restart=always
 Nice=15
 EOF
 
-    # CPU SERVICE
+    # CPU SERVICE (XMRig)
+    # Uses --rig-id and -p (pass) to ensure name shows on pool
     cat <<EOF > "$HOME/.config/systemd/user/$CPU_SERVICE"
 [Unit]
-Description=CPU Miner
+Description=CPU Miner (XMRig)
 After=network.target
 [Service]
 Type=simple
 EnvironmentFile=$ENV_FILE
 EnvironmentFile=$RUNTIME_ENV
-ExecStart=/usr/bin/xmrig -o gulf.moneroocean.stream:20128 -u \${CPU_WALLET} --proxy=\${PROXY_ADDR} --tls -k --coin monero -t \${CURRENT_CPU_THREADS} --cpu-no-yield
+ExecStart=/usr/bin/xmrig -o gulf.moneroocean.stream:20128 -u \${CPU_WALLET} -p \${CPU_WORKER} --rig-id \${CPU_WORKER} --proxy=\${PROXY_ADDR} --tls -k --coin monero -t \${CURRENT_CPU_THREADS} --cpu-no-yield
 Restart=always
 Nice=19
 EOF
 
-    # WATCHDOG SCRIPT (V8.2 INTELLIGENT)
+    # WATCHDOG SCRIPT (UNCHANGED LOGIC)
     cat <<'EOF' > "$WATCHDOG_SCRIPT"
 #!/bin/bash
 CONFIG_DIR="$HOME/.config/mining-manager"
@@ -117,15 +132,11 @@ RUNTIME_ENV="$CONFIG_DIR/runtime.env"
 GPU_SRV="miner-gpu.service"
 CPU_SRV="miner-cpu.service"
 
-# Внутренний таймер простоя (так как система нам его не дает)
 MY_IDLE_TIMER=0
 LAST_INT_COUNT=0
 LOOP_DELAY=5
 
-# === ФУНКЦИЯ ЧТЕНИЯ АКТИВНОСТИ ЖЕЛЕЗА ===
 get_hardware_interrupts() {
-    # Складываем количество прерываний от USB (xhci) и клавиатуры/тачпада (i8042)
-    # Это работает на уровне ядра, игнорируя Wayland
     grep -E "xhci|i8042" /proc/interrupts | awk '{ for(i=2;i<=NF;i++) sum+=$i } END { print sum }'
 }
 
@@ -140,33 +151,25 @@ is_video_playing() {
     fi
 }
 
-# Инициализация первого значения
 LAST_INT_COUNT=$(get_hardware_interrupts)
 current_mode="unknown"
 
-echo "Watchdog started. Mode: KERNEL HARDWARE MONITOR (Universal)"
+echo "Watchdog started. Mode: KERNEL HARDWARE MONITOR"
 
 while true; do
     source "$ENV_FILE" 2>/dev/null
 
-    # 1. Получаем текущее число прерываний (кликов/движений)
     CURRENT_INT_COUNT=$(get_hardware_interrupts)
-
-    # 2. Вычисляем разницу с прошлого раза
     DIFF=$((CURRENT_INT_COUNT - LAST_INT_COUNT))
 
-    # Если было много прерываний (>100), значит юзер шевелил мышкой/клавой
     if [ "$DIFF" -gt 100 ]; then
         MY_IDLE_TIMER=0
     else
-        # Иначе добавляем время к таймеру
         MY_IDLE_TIMER=$((MY_IDLE_TIMER + LOOP_DELAY))
     fi
 
-    # Обновляем "прошлое" значение
     LAST_INT_COUNT=$CURRENT_INT_COUNT
 
-    # 3. Логика переключения
     if [ "$MY_IDLE_TIMER" -lt "$IDLE_TIMEOUT" ] || is_video_playing; then
         target_mode="active"
         target_threads=$CPU_THREADS_ACTIVE
@@ -175,7 +178,6 @@ while true; do
         target_threads=$CPU_THREADS_IDLE
     fi
 
-    # 4. Применение
     running_threads=$(grep "CURRENT_CPU_THREADS" "$RUNTIME_ENV" 2>/dev/null | cut -d'=' -f2)
 
     if [ "$current_mode" != "$target_mode" ] || [ "$running_threads" != "$target_threads" ]; then
@@ -224,39 +226,40 @@ EOF
     systemctl --user enable --now $WATCHDOG_SERVICE
 }
 
-# --- 2. ИНТЕРФЕЙС МЕНЮ ---
+# --- 2. MENU INTERFACE ---
 
 show_status() {
-    echo -e "\n${CYAN}--- СТАТУС СИСТЕМЫ ---${NC}"
+    echo -e "\n${CYAN}--- SYSTEM STATUS ---${NC}"
     source "$ENV_FILE" 2>/dev/null
     cur_threads=$(grep "CURRENT_CPU_THREADS" "$RUNTIME_ENV" 2>/dev/null | cut -d'=' -f2)
 
-    echo -e "Режим потоков: ${YELLOW}${cur_threads:-ЗАГРУЗКА}${NC} (В конфиге Active=$CPU_THREADS_ACTIVE / Idle=$CPU_THREADS_IDLE)"
+    echo -e "CPU Threads: ${YELLOW}${cur_threads:-LOADING}${NC} (Active=$CPU_THREADS_ACTIVE / Idle=$CPU_THREADS_IDLE)"
+    echo -e "Workers: GPU=[${CYAN}$GPU_WORKER${NC}] CPU=[${CYAN}$CPU_WORKER${NC}]"
 
-    echo -n "Watchdog: "; systemctl --user is-active --quiet $WATCHDOG_SERVICE && echo -e "${GREEN}РАБОТАЕТ${NC}" || echo -e "${RED}ВЫКЛ${NC}"
-    echo -n "GPU: "; systemctl --user is-active --quiet $GPU_SERVICE && echo -e "${GREEN}РАБОТАЕТ${NC}" || echo -e "${YELLOW}СПИТ${NC}"
-    echo -n "CPU: "; systemctl --user is-active --quiet $CPU_SERVICE && echo -e "${GREEN}РАБОТАЕТ${NC}" || echo -e "${YELLOW}СПИТ${NC}"
+    echo -n "Watchdog: "; systemctl --user is-active --quiet $WATCHDOG_SERVICE && echo -e "${GREEN}RUNNING${NC}" || echo -e "${RED}OFF${NC}"
+    echo -n "GPU: "; systemctl --user is-active --quiet $GPU_SERVICE && echo -e "${GREEN}MINING${NC}" || echo -e "${YELLOW}SLEEPING${NC}"
+    echo -n "CPU: "; systemctl --user is-active --quiet $CPU_SERVICE && echo -e "${GREEN}MINING${NC}" || echo -e "${YELLOW}SLEEPING${NC}"
     echo "----------------------"
 }
 
 main_menu() {
     while true; do
         clear
-        echo -e "${BLUE}=== MINING MANAGER v8.2 (AUTO-RELOAD) ===${NC}"
+        echo -e "${BLUE}=== MINING MANAGER v8.3 (GMiner Only) ===${NC}"
         show_status
-        echo "1. Вкл/Выкл Все службы"
-        echo "2. Изменить конфиг (применится автоматически)"
-        echo "3. Сбросить всё и ПЕРЕУСТАНОВИТЬ (ВАЖНО ДЛЯ ОБНОВЛЕНИЯ)"
-        echo "4. Логи: Процессор"
-        echo "5. Логи: Видеокарта"
-        echo "6. Логи: Watchdog"
-        echo "7. Выход"
+        echo "1. Toggle All Services (On/Off)"
+        echo "2. Edit Config (Names/Wallets)"
+        echo "3. RESET & REINSTALL (Use this to apply name changes)"
+        echo "4. Logs: CPU"
+        echo "5. Logs: GPU"
+        echo "6. Logs: Watchdog"
+        echo "7. Exit"
         echo ""
         read -p "> " choice
         case $choice in
             1) systemctl --user is-active --quiet $WATCHDOG_SERVICE && systemctl --user stop $WATCHDOG_SERVICE $GPU_SERVICE $CPU_SERVICE || systemctl --user start $WATCHDOG_SERVICE ;;
-            2) nano "$ENV_FILE" ;; # Больше не нужно рестартить руками
-            3) rm -rf "$CONFIG_DIR"; echo "Конфиг сброшен. Перезапустите скрипт."; exit 0 ;;
+            2) nano "$ENV_FILE" ;;
+            3) rm -rf "$CONFIG_DIR"; echo "Config deleted. Please restart script to reconfigure."; exit 0 ;;
             4) journalctl --user -f -u $CPU_SERVICE ;;
             5) journalctl --user -f -u $GPU_SERVICE ;;
             6) journalctl --user -f -u $WATCHDOG_SERVICE ;;

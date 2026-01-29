@@ -77,7 +77,8 @@ compile_xmrig() {
     echo -e "${CYAN}=== COMPILING XMRIG ===${NC}"
     if ! command -v cmake &> /dev/null; then pkg install -y git cmake libuv openssl clang make hwloc pkg-config; fi
     cd "$HOME"
-    if [ -d "xmrig" ]; then cd xmrig && git pull; else git clone https://github.com/xmrig/xmrig.git && cd xmrig; fi
+    rm -rf "$HOME/xmrig"
+    if [ -d "xmrig" ]; then cd xmrig && git pull; else git clone https://github.com/MoneroOcean/xmrig.git && cd xmrig; fi
     rm -rf build && mkdir -p build && cd build
     echo -e "${BLUE}Configuring (No HWLOC/CUDA/OpenCL)...${NC}"
     cmake .. -DWITH_OPENCL=OFF -DWITH_CUDA=OFF -DWITH_HWLOC=OFF -DCMAKE_BUILD_TYPE=Release

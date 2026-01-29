@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ============================================================
-# MINING MANAGER v8.4 (Toggle GPU Feature)
+# MINING MANAGER v8.6 (SystemD Path Fix)
 # ============================================================
 
 CONFIG_DIR="$HOME/.config/mining-manager"
@@ -22,16 +22,18 @@ NC='\033[0m'
 
 mkdir "$HOME/.config/systemd/user" -p
 
+# Detect AUR Helper globally
+if command -v yay &> /dev/null; then AUR="yay"; elif command -v paru &> /dev/null; then AUR="paru"; else AUR=""; fi
+
 # --- 1. SYSTEM FUNCTIONS ---
 
 install_deps() {
     echo -e "${BLUE}Installing system components...${NC}"
-    if command -v yay &> /dev/null; then AUR="yay"; elif command -v paru &> /dev/null; then AUR="paru"; else echo "AUR helper needed (yay or paru)!"; exit 1; fi
+    if [ -z "$AUR" ]; then echo "AUR helper needed (yay or paru)!"; exit 1; fi
 
-    # Update system and install common deps
     sudo pacman -S --needed cuda gamemode xmrig git base-devel xprintidle
 
-    # Force install Gminer if not present (Installs binaries regardless of config, just in case)
+    # Force install Gminer if not present
     if [ ! -f /usr/bin/gminer ] && [ ! -f /opt/gminer/miner ]; then
         echo -e "${CYAN}Installing Gminer...${NC}"
         $AUR -S --needed --noconfirm gminer-bin
@@ -48,6 +50,32 @@ setup_config() {
     touch "$RUNTIME_ENV"
 
     echo -e "${CYAN}=== SETUP WIZARD ===${NC}"
+
+    # --- CPU SOFTWARE SELECTION ---
+    echo -e "${YELLOW}CPU Miner Software:${NC}"
+    echo "1. Standard XMRig (Official package)"
+    echo "2. XMRig-MO (MoneroOcean Fork - Algo Switching)"
+    read -p "Select [1/2]: " mo_choice
+
+    if [[ "$mo_choice" == "2" ]]; then
+        echo -e "${BLUE}Checking for XMRig-MO...${NC}"
+        if ! command -v xmrig-mo &> /dev/null; then
+            echo -e "${CYAN}Installing xmrig-mo from AUR...${NC}"
+            $AUR -S --needed --noconfirm xmrig-mo
+        fi
+
+        if command -v xmrig-mo &> /dev/null; then
+            CHOSEN_CPU_BIN=$(command -v xmrig-mo)
+            echo -e "${GREEN}Selected: XMRig-MO ($CHOSEN_CPU_BIN)${NC}"
+        else
+            echo -e "${RED}Failed to install XMRig-MO. Falling back to Standard.${NC}"
+            CHOSEN_CPU_BIN="/usr/bin/xmrig"
+        fi
+    else
+        CHOSEN_CPU_BIN="/usr/bin/xmrig"
+        echo -e "${GREEN}Selected: Standard XMRig${NC}"
+    fi
+    echo ""
 
     # --- GPU SETUP ---
     echo -e "${YELLOW}GPU Configuration:${NC}"
@@ -85,6 +113,7 @@ setup_config() {
     # Write Config
     cat <<EOF > "$ENV_FILE"
 MINER_BIN=$M_BIN
+CPU_BIN=$CHOSEN_CPU_BIN
 GPU_ALGO=kawpow
 GPU_SERVER=gulf.moneroocean.stream:10128
 GPU_WALLET=$gpu_wal
@@ -106,8 +135,7 @@ EOF
 create_services() {
     echo -e "${BLUE}Updating services and scripts...${NC}"
 
-    # GPU SERVICE (Gminer Only)
-    # Service file is always created, but Watchdog controls if it starts
+    # GPU SERVICE (Fixed: Uses bash -c to allow variable expansion)
     cat <<EOF > "$HOME/.config/systemd/user/$GPU_SERVICE"
 [Unit]
 Description=GPU Miner (Gminer)
@@ -117,21 +145,21 @@ Type=simple
 EnvironmentFile=$ENV_FILE
 Environment=all_proxy=http://\${PROXY_ADDR}
 Environment=https_proxy=http://\${PROXY_ADDR}
-ExecStart=\${MINER_BIN} --algo \${GPU_ALGO} --server \${GPU_SERVER} --user \${GPU_WALLET} --worker \${GPU_WORKER}
+ExecStart=/bin/bash -c "exec \${MINER_BIN} --algo \${GPU_ALGO} --server \${GPU_SERVER} --user \${GPU_WALLET} --worker \${GPU_WORKER}"
 Restart=always
 Nice=15
 EOF
 
-    # CPU SERVICE (XMRig)
+    # CPU SERVICE (Fixed: Uses bash -c to allow variable expansion)
     cat <<EOF > "$HOME/.config/systemd/user/$CPU_SERVICE"
 [Unit]
-Description=CPU Miner (XMRig)
+Description=CPU Miner
 After=network.target
 [Service]
 Type=simple
 EnvironmentFile=$ENV_FILE
 EnvironmentFile=$RUNTIME_ENV
-ExecStart=/usr/bin/xmrig -o gulf.moneroocean.stream:20128 -u \${CPU_WALLET} -p \${CPU_WORKER} --rig-id \${CPU_WORKER} --proxy=\${PROXY_ADDR} --tls -k --coin monero -t \${CURRENT_CPU_THREADS} --cpu-no-yield
+ExecStart=/bin/bash -c "exec \${CPU_BIN} -o gulf.moneroocean.stream:20128 -u \${CPU_WALLET} -p \${CPU_WORKER} --rig-id \${CPU_WORKER} --proxy=\${PROXY_ADDR} --tls -k --coin monero -t \${CURRENT_CPU_THREADS} --cpu-no-yield"
 Restart=always
 Nice=19
 EOF
@@ -254,9 +282,10 @@ show_status() {
     source "$ENV_FILE" 2>/dev/null
     cur_threads=$(grep "CURRENT_CPU_THREADS" "$RUNTIME_ENV" 2>/dev/null | cut -d'=' -f2)
 
-    echo -e "CPU Threads: ${YELLOW}${cur_threads:-LOADING}${NC} (Active=$CPU_THREADS_ACTIVE / Idle=$CPU_THREADS_IDLE)"
+    if [[ "$CPU_BIN" == *xmrig-mo* ]]; then cpu_ver="XMRig-MO"; else cpu_ver="Standard"; fi
 
-    # Display GPU status based on config
+    echo -e "CPU Miner:   ${YELLOW}${cpu_ver}${NC} (Threads: $cur_threads)"
+
     if [ "$USE_GPU_MINING" = "true" ]; then
         echo -e "GPU Config:  ${GREEN}ENABLED${NC} (Worker: $GPU_WORKER)"
     else
@@ -279,11 +308,11 @@ show_status() {
 main_menu() {
     while true; do
         clear
-        echo -e "${BLUE}=== MINING MANAGER v8.4 (GPU Toggle) ===${NC}"
+        echo -e "${BLUE}=== MINING MANAGER v8.6 (Fix) ===${NC}"
         show_status
         echo "1. Toggle All Services (On/Off)"
         echo "2. Edit Config (Names/Wallets/Threads)"
-        echo "3. RESET & REINSTALL (Change GPU Setting)"
+        echo "3. RESET & REINSTALL (Fix Service Errors)"
         echo "4. Logs: CPU"
         echo "5. Logs: GPU"
         echo "6. Logs: Watchdog"

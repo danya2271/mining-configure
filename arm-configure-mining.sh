@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ============================================================
-# MINING MANAGER v9.9 (Standard Sudo Implementation)
+# MINING MANAGER v10.0 (Fix: Disable HWLOC & Clean Build)
 # ============================================================
 
 # Define Paths (Relative to User Home)
@@ -38,9 +38,8 @@ mkdir -p "$CONFIG_DIR"
 install_deps() {
     echo -e "${BLUE}Installing dependencies...${NC}"
     pkg update -y
-    # We install 'tsu' because it provides the 'sudo' binary in Termux main repo
-    # If user already has 'termux-sudo' or another provider, this skips.
-    pkg install -y git cmake libuv openssl clang make hwloc termux-tools jq procps grep tsu
+    # Added pkg-config to help find libraries
+    pkg install -y git cmake libuv openssl clang make hwloc pkg-config termux-tools jq procps grep tsu
 
     if ! command -v sudo &> /dev/null; then
         echo -e "${RED}Error: 'sudo' command not found.${NC}"
@@ -52,11 +51,13 @@ install_deps() {
 compile_xmrig() {
     echo -e "${CYAN}=== COMPILING XMRIG (Native User Mode) ===${NC}"
 
+    # 1. Install Build Tools if missing
     if ! command -v cmake &> /dev/null; then
         echo -e "${YELLOW}Installing build tools...${NC}"
-        pkg install -y git cmake libuv openssl clang make hwloc
+        pkg install -y git cmake libuv openssl clang make hwloc pkg-config
     fi
 
+    # 2. Get Source
     cd "$HOME"
     if [ -d "xmrig" ]; then
         echo -e "${BLUE}Updating XMRig source...${NC}"
@@ -67,12 +68,22 @@ compile_xmrig() {
         cd xmrig
     fi
 
-    echo -e "${BLUE}Configuring Build...${NC}"
+    # 3. Clean Build Directory (Fix for cached errors)
+    echo -e "${BLUE}Cleaning old build...${NC}"
+    rm -rf build
     mkdir -p build && cd build
-    rm -f CMakeCache.txt
-    # Disable OpenCL/CUDA to speed up compile and avoid errors
-    cmake .. -DWITH_OPENCL=OFF -DWITH_CUDA=OFF -DCMAKE_BUILD_TYPE=Release
 
+    # 4. Configure CMake
+    echo -e "${BLUE}Configuring Build (Disabling HWLOC to fix errors)...${NC}"
+
+    # FIX: -DWITH_HWLOC=OFF disables the library causing your error
+    cmake .. \
+        -DWITH_OPENCL=OFF \
+        -DWITH_CUDA=OFF \
+        -DWITH_HWLOC=OFF \
+        -DCMAKE_BUILD_TYPE=Release
+
+    # 5. Compile
     echo -e "${BLUE}Compiling ($(nproc) threads)...${NC}"
     make -j$(nproc)
 
@@ -227,21 +238,17 @@ EOF
 }
 
 start_watchdog() {
-    # Check if we have sudo capability
     if ! command -v sudo &> /dev/null; then
         echo -e "${RED}Error: 'sudo' command missing. Please install it.${NC}"
         return
     fi
 
-    # Check if already running (requires sudo to check pid existence accurately in /proc sometimes, but file check is usually enough)
     if [ -f "$WATCHDOG_PID_FILE" ]; then
         PID=$(cat "$WATCHDOG_PID_FILE")
-        # Check if process exists using sudo
         if sudo kill -0 "$PID" 2>/dev/null; then
             echo -e "${YELLOW}Watchdog service is already running (PID: $PID).${NC}"
             return
         fi
-        # If file exists but process dead, clean up
         rm "$WATCHDOG_PID_FILE"
     fi
 
@@ -250,12 +257,7 @@ start_watchdog() {
 
     echo -e "${GREEN}Starting Watchdog Service... (Please grant Sudo access)${NC}"
 
-    # Run the watchdog script with sudo, in background, suppressing output
     sudo nohup bash "$WATCHDOG_SCRIPT" >/dev/null 2>&1 &
-
-    # Capture the PID of the sudo'd process is tricky with nohup,
-    # so we rely on the shell returning the background job PID.
-    # Note: This PID might be the sudo wrapper, but killing it usually propagates.
     echo $! > "$WATCHDOG_PID_FILE"
 
     echo -e "${GREEN}Service Started! Check logs for details.${NC}"
@@ -291,7 +293,7 @@ set_mode() {
 # --- 4. STATUS DISPLAY ---
 
 show_status() {
-    echo -e "\n${CYAN}--- MINER STATUS (v9.9) ---${NC}"
+    echo -e "\n${CYAN}--- MINER STATUS (v10.0) ---${NC}"
 
     [ ! -f "$MODE_FILE" ] && echo "AUTO" > "$MODE_FILE"
     MODE=$(cat "$MODE_FILE")
@@ -301,7 +303,6 @@ show_status() {
     elif [ "$MODE" == "FORCE_STOP" ]; then echo -e "${RED}FORCE STOP${NC}";
     else echo -e "${GREEN}AUTO (Strict)${NC}"; fi
 
-    # Check miner state via PID file existence
     echo -n "Miner State:  "
     if [ -f "$MINER_PID_FILE" ]; then
          echo -e "${GREEN}Running (PID File Found)${NC}"
@@ -309,7 +310,6 @@ show_status() {
          echo -e "${YELLOW}Stopped${NC}"
     fi
 
-    # Show recent log
     echo -e "${BLUE}Recent Log:${NC}"
     if [ -f "$LOG_FILE" ]; then
         tail -n 1 "$LOG_FILE"

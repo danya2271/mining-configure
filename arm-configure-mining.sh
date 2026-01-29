@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ============================================================
-# MINING MANAGER v9.3 (Strict + Force Mode Support)
+# MINING MANAGER v9.4 (Strict + Force Mode + Source Compile)
 # ============================================================
 
 CONFIG_DIR="$HOME/.config/mining-manager"
@@ -29,21 +29,103 @@ fi
 
 mkdir -p "$CONFIG_DIR"
 
-# --- 1. SYSTEM FUNCTIONS ---
+# --- 1. INSTALLATION & COMPILE FUNCTIONS ---
 
-install_deps() {
-    echo -e "${BLUE}Installing system components...${NC}"
+install_base_deps() {
+    echo -e "${BLUE}Installing base system tools...${NC}"
     pkg update -y
-    pkg install -y xmrig termux-tools jq procps grep
+    pkg install -y termux-tools jq procps grep
 
     echo -e "${BLUE}Optimizing Huge Pages...${NC}"
     echo 1280 > /proc/sys/vm/nr_hugepages
 }
 
+compile_xmrig() {
+    echo -e "${CYAN}=== COMPILING XMRIG FROM SOURCE (ARM64) ===${NC}"
+    echo -e "${YELLOW}This process will take 5-15 minutes.${NC}"
+
+    # 1. Install Build Dependencies
+    pkg install -y git cmake libuv openssl clang make hwloc
+
+    # 2. Clone
+    cd "$HOME"
+    if [ -d "xmrig" ]; then
+        echo -e "${YELLOW}Existing xmrig folder found. Updating...${NC}"
+        cd xmrig
+        git pull
+    else
+        git clone https://github.com/xmrig/xmrig.git
+        cd xmrig
+    fi
+
+    # 3. Build
+    mkdir -p build && cd build
+    echo -e "${BLUE}Configuring CMake...${NC}"
+    # Disable OpenCL/CUDA for pure CPU mining to save build time/errors
+    cmake .. -DWITH_OPENCL=OFF -DWITH_CUDA=OFF -DCMAKE_BUILD_TYPE=Release
+
+    echo -e "${BLUE}Compiling (This takes time)...${NC}"
+    make -j$(nproc)
+
+    if [ -f "./xmrig" ]; then
+        echo -e "${GREEN}Compilation Successful!${NC}"
+        return 0
+    else
+        echo -e "${RED}Compilation Failed.${NC}"
+        return 1
+    fi
+}
+
+install_xmrig_menu() {
+    clear
+    echo -e "${CYAN}=== XMRIG INSTALLATION WIZARD ===${NC}"
+    echo "1. Install via Package Manager (Fast, Standard Version)"
+    echo "2. Compile from Source (Slow, Optimized, Latest Version)"
+    echo "3. Skip (I already have it)"
+    echo ""
+    read -p "> " install_choice
+
+    XM_PATH="xmrig" # Default global path
+
+    case $install_choice in
+        1)
+            pkg install -y xmrig
+            XM_PATH="xmrig"
+            ;;
+        2)
+            if compile_xmrig; then
+                XM_PATH="$HOME/xmrig/build/xmrig"
+            else
+                echo -e "${RED}Falling back to package manager...${NC}"
+                sleep 2
+                pkg install -y xmrig
+                XM_PATH="xmrig"
+            fi
+            ;;
+        3)
+            # User claims to have it. Check generic or local.
+            if [ -f "$HOME/xmrig/build/xmrig" ]; then
+                XM_PATH="$HOME/xmrig/build/xmrig"
+            else
+                XM_PATH="xmrig"
+            fi
+            ;;
+    esac
+
+    # Save the path temporarily to return it or write to config
+    echo "$XM_PATH" > "$CONFIG_DIR/temp_bin_path"
+}
+
 setup_config() {
     touch "$RUNTIME_ENV"
     echo "AUTO" > "$MODE_FILE"
-    echo -e "${CYAN}=== SETUP WIZARD ===${NC}"
+
+    # Run Install Wizard
+    install_xmrig_menu
+    CPU_BIN_PATH=$(cat "$CONFIG_DIR/temp_bin_path")
+    rm "$CONFIG_DIR/temp_bin_path"
+
+    echo -e "${CYAN}=== CONFIGURATION ===${NC}"
 
     # --- CONFIG ---
     read -p "Pool Address [Default: gulf.moneroocean.stream:10128]: " cpu_server_in
@@ -59,7 +141,7 @@ setup_config() {
 
     # Write Config
     cat <<EOF > "$ENV_FILE"
-CPU_BIN=xmrig
+CPU_BIN=$CPU_BIN_PATH
 CPU_SERVER=$cpu_server
 CPU_WALLET=$cpu_wal
 CPU_WORKER=${cpu_worker:-AndroidMiner}
@@ -152,6 +234,13 @@ start_watchdog() {
                 if [ ! -f "$MINER_PID" ] || ! kill -0 $(cat "$MINER_PID") 2>/dev/null; then
                     echo "$(date): Starting miner (Mode: $CURRENT_MODE)..." >> "$LOG_FILE"
 
+                    # Verify binary exists
+                    if [ ! -x "$(command -v $CPU_BIN)" ] && [ ! -f "$CPU_BIN" ]; then
+                        echo "ERROR: XMRig binary not found at $CPU_BIN" >> "$LOG_FILE"
+                        sleep 10
+                        continue
+                    fi
+
                     nohup $CPU_BIN -o $CPU_SERVER -u $CPU_WALLET -p $CPU_WORKER \
                         --threads=$CPU_THREADS --cpu-no-yield \
                         --randomx-1gb-pages \
@@ -183,7 +272,6 @@ stop_all_services() {
 set_mode() {
     echo "$1" > "$MODE_FILE"
     echo -e "Mode switched to: ${CYAN}$1${NC}"
-    # Ensure watchdog is running to apply the new mode immediately
     start_watchdog
 }
 
@@ -192,7 +280,6 @@ set_mode() {
 show_status() {
     echo -e "\n${CYAN}--- MINER STATUS ---${NC}"
 
-    # Get Mode
     [ ! -f "$MODE_FILE" ] && echo "AUTO" > "$MODE_FILE"
     MODE=$(cat "$MODE_FILE")
 
@@ -209,8 +296,11 @@ show_status() {
     BAT_CAP=$(cat /sys/class/power_supply/battery/capacity 2>/dev/null)
     BAT_STAT=$(cat /sys/class/power_supply/battery/status 2>/dev/null)
 
+    # If sensors failed to read, show N/A
+    if [ -z "$BAT_CAP" ]; then BAT_CAP="N/A"; fi
+
     echo -n "Battery:      "
-    if [ "$BAT_CAP" -eq 100 ] && [[ "$BAT_STAT" == "Charging" || "$BAT_STAT" == "Full" ]]; then
+    if [ "$BAT_CAP" == "100" ] && [[ "$BAT_STAT" == "Charging" || "$BAT_STAT" == "Full" ]]; then
         echo -e "${GREEN}${BAT_CAP}% ($BAT_STAT)${NC}"
     else
         echo -e "${RED}${BAT_CAP}% ($BAT_STAT)${NC}"
@@ -226,7 +316,13 @@ show_status() {
     echo -n "XMRig Miner:  "
     if [ -f "$MINER_PID" ] && kill -0 $(cat "$MINER_PID") 2>/dev/null; then
         source "$ENV_FILE" 2>/dev/null
-        echo -e "${GREEN}RUNNING${NC} (Threads: $CPU_THREADS)"
+        # Display binary type
+        if [[ "$CPU_BIN" == *"build/xmrig"* ]]; then
+            TYPE="(Compiled)"
+        else
+            TYPE="(Pkg)"
+        fi
+        echo -e "${GREEN}RUNNING $TYPE${NC} (Threads: $CPU_THREADS)"
     else
         echo -e "${YELLOW}STOPPED${NC}"
     fi
@@ -236,34 +332,45 @@ show_status() {
 main_menu() {
     while true; do
         clear
-        echo -e "${BLUE}=== MINING MANAGER v9.3 ===${NC}"
+        echo -e "${BLUE}=== MINING MANAGER v9.4 (ARM64) ===${NC}"
         show_status
-        echo "1. Set Mode: AUTO (Strict 100% + Screen OFF)"
-        echo "2. Set Mode: FORCE START (Ignore Sensors)"
-        echo "3. Set Mode: FORCE STOP (Kill Miner)"
+        echo "1. Set Mode: AUTO (Strict)"
+        echo "2. Set Mode: FORCE START"
+        echo "3. Set Mode: FORCE STOP"
         echo "--------------------------------"
-        echo "4. Restart Watchdog"
-        echo "5. KILL EVERYTHING (Exit)"
-        echo "6. Edit Config"
-        echo "7. View Logs"
-        echo "8. Exit Menu"
+        echo "4. INSTALL / UPDATE XMRig"
+        echo "5. Restart Watchdog"
+        echo "6. KILL EVERYTHING (Exit)"
+        echo "7. Edit Config"
+        echo "8. View Logs"
+        echo "9. Exit Menu"
         echo ""
         read -p "> " choice
         case $choice in
             1) set_mode "AUTO" ;;
             2) set_mode "FORCE_START" ;;
             3) set_mode "FORCE_STOP" ;;
-            4) stop_all_services; start_watchdog ;;
-            5) stop_all_services; exit 0 ;;
-            6) nano "$ENV_FILE" ;;
-            7) tail -f "$LOG_FILE" ;;
-            8) exit 0 ;;
+            4)
+               install_base_deps
+               install_xmrig_menu
+               CPU_BIN_PATH=$(cat "$CONFIG_DIR/temp_bin_path")
+               rm "$CONFIG_DIR/temp_bin_path"
+               # Update Config with new path
+               sed -i "s|CPU_BIN=.*|CPU_BIN=$CPU_BIN_PATH|" "$ENV_FILE"
+               echo -e "${GREEN}Updated binary path to: $CPU_BIN_PATH${NC}"
+               sleep 2
+               ;;
+            5) stop_all_services; start_watchdog ;;
+            6) stop_all_services; exit 0 ;;
+            7) nano "$ENV_FILE" ;;
+            8) tail -f "$LOG_FILE" ;;
+            9) exit 0 ;;
         esac
     done
 }
 
 if [ ! -f "$ENV_FILE" ]; then
-    install_deps
+    install_base_deps
     setup_config
 fi
 

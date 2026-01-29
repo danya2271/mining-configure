@@ -1,17 +1,21 @@
 #!/bin/bash
 
 # ============================================================
-# MINING MANAGER v10.0 (Fix: Disable HWLOC & Clean Build)
+# MINING MANAGER v10.1 (Fix: Sudo Paths & Debugging)
 # ============================================================
 
-# Define Paths (Relative to User Home)
+# Define Paths
 CONFIG_DIR="$HOME/.config/mining-manager"
 ENV_FILE="$CONFIG_DIR/mining.env"
 WATCHDOG_SCRIPT="$CONFIG_DIR/watchdog_runner.sh"
 WATCHDOG_PID_FILE="$CONFIG_DIR/watchdog.pid"
 MINER_PID_FILE="$CONFIG_DIR/xmrig.pid"
 LOG_FILE="$CONFIG_DIR/miner.log"
+DEBUG_LOG="$CONFIG_DIR/debug.log"
 MODE_FILE="$CONFIG_DIR/mode"
+
+# Detect absolute path to bash in Termux
+TERMUX_BASH=$(command -v bash)
 
 # Colors
 GREEN='\033[0;32m'
@@ -22,96 +26,56 @@ CYAN='\033[0;36m'
 NC='\033[0m'
 
 # --- 1. INITIAL CHECKS ---
-
-# Ensure we are NOT root (User Mode UI)
 if [ "$(id -u)" -eq 0 ]; then
     echo -e "${YELLOW}Warning: You are running this script as ROOT.${NC}"
-    echo "Please run as a normal user (./script.sh). The script will ask for sudo when needed."
-    echo ""
+    echo "Please run as a normal user. The script will ask for sudo internally."
     read -p "Press Enter to continue anyway..."
 fi
 
 mkdir -p "$CONFIG_DIR"
 
-# --- 2. INSTALLATION FUNCTIONS (User Mode) ---
+# --- 2. INSTALLATION (User Mode) ---
 
 install_deps() {
     echo -e "${BLUE}Installing dependencies...${NC}"
     pkg update -y
-    # Added pkg-config to help find libraries
     pkg install -y git cmake libuv openssl clang make hwloc pkg-config termux-tools jq procps grep tsu
 
     if ! command -v sudo &> /dev/null; then
-        echo -e "${RED}Error: 'sudo' command not found.${NC}"
-        echo "Please install it: pkg install tsu (or termux-sudo)"
+        echo -e "${RED}Error: 'sudo' command not found. Install 'tsu'.${NC}"
         return 1
     fi
 }
 
 compile_xmrig() {
-    echo -e "${CYAN}=== COMPILING XMRIG (Native User Mode) ===${NC}"
+    echo -e "${CYAN}=== COMPILING XMRIG ===${NC}"
+    if ! command -v cmake &> /dev/null; then pkg install -y git cmake libuv openssl clang make hwloc pkg-config; fi
 
-    # 1. Install Build Tools if missing
-    if ! command -v cmake &> /dev/null; then
-        echo -e "${YELLOW}Installing build tools...${NC}"
-        pkg install -y git cmake libuv openssl clang make hwloc pkg-config
-    fi
-
-    # 2. Get Source
     cd "$HOME"
-    if [ -d "xmrig" ]; then
-        echo -e "${BLUE}Updating XMRig source...${NC}"
-        cd xmrig && git pull
-    else
-        echo -e "${BLUE}Cloning XMRig...${NC}"
-        git clone https://github.com/xmrig/xmrig.git
-        cd xmrig
-    fi
+    if [ -d "xmrig" ]; then cd xmrig && git pull; else git clone https://github.com/xmrig/xmrig.git && cd xmrig; fi
 
-    # 3. Clean Build Directory (Fix for cached errors)
-    echo -e "${BLUE}Cleaning old build...${NC}"
-    rm -rf build
-    mkdir -p build && cd build
+    rm -rf build && mkdir -p build && cd build
+    echo -e "${BLUE}Configuring (No HWLOC/CUDA/OpenCL)...${NC}"
+    cmake .. -DWITH_OPENCL=OFF -DWITH_CUDA=OFF -DWITH_HWLOC=OFF -DCMAKE_BUILD_TYPE=Release
 
-    # 4. Configure CMake
-    echo -e "${BLUE}Configuring Build (Disabling HWLOC to fix errors)...${NC}"
-
-    # FIX: -DWITH_HWLOC=OFF disables the library causing your error
-    cmake .. \
-        -DWITH_OPENCL=OFF \
-        -DWITH_CUDA=OFF \
-        -DWITH_HWLOC=OFF \
-        -DCMAKE_BUILD_TYPE=Release
-
-    # 5. Compile
-    echo -e "${BLUE}Compiling ($(nproc) threads)...${NC}"
+    echo -e "${BLUE}Compiling...${NC}"
     make -j$(nproc)
 
-    if [ -f "xmrig" ]; then
-        echo -e "${GREEN}Compilation Successful!${NC}"
-        return 0
-    else
-        echo -e "${RED}Compilation Failed.${NC}"
-        return 1
-    fi
+    if [ -f "xmrig" ]; then echo -e "${GREEN}Success!${NC}"; return 0; else echo -e "${RED}Failed.${NC}"; return 1; fi
 }
 
 install_menu() {
     clear
-    echo -e "${CYAN}=== INSTALLATION WIZARD ===${NC}"
-    echo "1. Install Package (Fast, Standard)"
-    echo "2. Compile Source (Slow, Optimized)"
+    echo -e "${CYAN}=== INSTALL WIZARD ===${NC}"
+    echo "1. Install Package"
+    echo "2. Compile Source"
     echo "3. Skip"
     read -p "> " ch
-
     case $ch in
         1) pkg install -y xmrig; BIN="xmrig" ;;
         2) compile_xmrig && BIN="$HOME/xmrig/build/xmrig" || BIN="xmrig" ;;
-        *)
-           if [ -f "$HOME/xmrig/build/xmrig" ]; then BIN="$HOME/xmrig/build/xmrig"; else BIN="xmrig"; fi
-           ;;
+        *) if [ -f "$HOME/xmrig/build/xmrig" ]; then BIN="$HOME/xmrig/build/xmrig"; else BIN="xmrig"; fi ;;
     esac
-
     echo "$BIN" > "$CONFIG_DIR/bin_path"
 }
 
@@ -119,47 +83,41 @@ setup_config() {
     install_menu
     BIN_PATH=$(cat "$CONFIG_DIR/bin_path")
     rm "$CONFIG_DIR/bin_path"
-
     echo "AUTO" > "$MODE_FILE"
 
-    echo -e "${CYAN}=== CONFIGURATION ===${NC}"
-    read -p "Pool [Default: gulf.moneroocean.stream:10128]: " pool
+    read -p "Pool [gulf.moneroocean.stream:10128]: " pool
     pool=${pool:-gulf.moneroocean.stream:10128}
     read -p "Wallet: " wallet
-    read -p "Worker Name: " worker
-    worker=${worker:-AndroidWorker}
+    read -p "Worker: " worker
 
     cat <<EOF > "$ENV_FILE"
 CPU_BIN=$BIN_PATH
 CPU_SERVER=$pool
 CPU_WALLET=$wallet
-CPU_WORKER=$worker
+CPU_WORKER=${worker:-AndroidWorker}
 CPU_THREADS=$(nproc)
 EOF
-    echo -e "${GREEN}Config Saved.${NC}"
 }
 
 # --- 3. BACKGROUND SERVICE (ROOT LOGIC) ---
 
 generate_watchdog_script() {
-    # This script will be run by SUDO
+    # CRITICAL FIX: Use the explicit Termux Bash path in the shebang
     cat <<EOF > "$WATCHDOG_SCRIPT"
-#!/bin/bash
+#!$TERMUX_BASH
 
-# Load Config
+# 1. Load Environment
 source "$ENV_FILE"
 MODE_FILE="$MODE_FILE"
 MINER_PID="$MINER_PID_FILE"
 LOG="$LOG_FILE"
 
-# 1. Apply Root Optimizations
-echo 1280 > /proc/sys/vm/nr_hugepages
+# 2. Optimization
+echo 1280 > /proc/sys/vm/nr_hugepages 2>/dev/null
 
-# 2. Helper Functions
+# 3. Functions
 is_screen_on() {
-    # Method A: Dumpsys (Most reliable)
     if dumpsys window policy | grep -q "mScreenOnFully=true"; then return 0; fi
-    # Method B: Backlight
     val=\$(cat /sys/class/backlight/panel0-backlight/brightness 2>/dev/null)
     if [ "\$val" ] && [ "\$val" -gt 0 ]; then return 0; fi
     return 1
@@ -168,194 +126,165 @@ is_screen_on() {
 check_power() {
     CAP=\$(cat /sys/class/power_supply/battery/capacity 2>/dev/null)
     STAT=\$(cat /sys/class/power_supply/battery/status 2>/dev/null)
-    # Strict: 100% AND Charging/Full
     if [ "\$CAP" -eq 100 ] && [[ "\$STAT" == "Charging" || "\$STAT" == "Full" ]]; then return 0; fi
     return 1
 }
 
 kill_miner() {
-    REASON=\$1
     if [ -f "\$MINER_PID" ]; then
         PID=\$(cat "\$MINER_PID")
         if kill -0 "\$PID" 2>/dev/null; then
-            echo "\$(date): Stopping miner (\$REASON)" >> "\$LOG"
+            echo "\$(date): Stopping (\$1)" >> "\$LOG"
             kill "\$PID"
         fi
         rm "\$MINER_PID" 2>/dev/null
     fi
 }
 
-echo "\$(date): Watchdog Service Started (PID: \$\$)" >> "\$LOG"
+echo "\$(date): Watchdog Started" >> "\$LOG"
 
-# 3. Main Loop
 while true; do
     if [ ! -f "\$MODE_FILE" ]; then echo "AUTO" > "\$MODE_FILE"; fi
     MODE=\$(cat "\$MODE_FILE")
-
     SHOULD_MINE=false
     REASON=""
 
-    if [ "\$MODE" == "FORCE_START" ]; then
-        SHOULD_MINE=true
-    elif [ "\$MODE" == "FORCE_STOP" ]; then
-        SHOULD_MINE=false
-        REASON="Force Stop"
+    if [ "\$MODE" == "FORCE_START" ]; then SHOULD_MINE=true
+    elif [ "\$MODE" == "FORCE_STOP" ]; then SHOULD_MINE=false; REASON="Force Stop";
     else
-        # AUTO MODE
         if check_power; then
-            if ! is_screen_on; then
-                SHOULD_MINE=true
-            else
-                REASON="Screen is ON"
-            fi
-        else
-            REASON="Power < 100% or Unplugged"
-        fi
+            if ! is_screen_on; then SHOULD_MINE=true; else REASON="Screen ON"; fi
+        else REASON="Power < 100%"; fi
     fi
 
     if [ "\$SHOULD_MINE" = true ]; then
-        # Miner should be running
         if [ ! -f "\$MINER_PID" ] || ! kill -0 \$(cat "\$MINER_PID") 2>/dev/null; then
-            echo "\$(date): Starting Miner (Mode: \$MODE)..." >> "\$LOG"
-
-            # Start XMRig (Sudo environment)
+            echo "\$(date): Starting Miner (\$MODE)..." >> "\$LOG"
             nohup \$CPU_BIN -o \$CPU_SERVER -u \$CPU_WALLET -p \$CPU_WORKER \\
                 --threads=\$CPU_THREADS --cpu-no-yield --randomx-1gb-pages \\
                 --donate-level=1 >> "\$LOG" 2>&1 &
-
             echo \$! > "\$MINER_PID"
         fi
     else
-        # Miner should be stopped
         kill_miner "\$REASON"
     fi
-
     sleep 5
 done
 EOF
-    # Ensure script is executable
     chmod +x "$WATCHDOG_SCRIPT"
 }
 
 start_watchdog() {
-    if ! command -v sudo &> /dev/null; then
-        echo -e "${RED}Error: 'sudo' command missing. Please install it.${NC}"
-        return
-    fi
+    if ! command -v sudo &> /dev/null; then echo -e "${RED}Error: 'sudo' missing.${NC}"; return; fi
 
     if [ -f "$WATCHDOG_PID_FILE" ]; then
         PID=$(cat "$WATCHDOG_PID_FILE")
         if sudo kill -0 "$PID" 2>/dev/null; then
-            echo -e "${YELLOW}Watchdog service is already running (PID: $PID).${NC}"
-            return
+             echo -e "${YELLOW}Already running (PID: $PID).${NC}"; return
         fi
         rm "$WATCHDOG_PID_FILE"
     fi
 
-    echo -e "${BLUE}Generating Service Script...${NC}"
+    echo -e "${BLUE}Generating Script...${NC}"
     generate_watchdog_script
 
-    echo -e "${GREEN}Starting Watchdog Service... (Please grant Sudo access)${NC}"
+    echo -e "${GREEN}Starting Service (Grant Sudo)...${NC}"
 
-    sudo nohup bash "$WATCHDOG_SCRIPT" >/dev/null 2>&1 &
-    echo $! > "$WATCHDOG_PID_FILE"
+    # Clean debug log
+    echo "--- New Run ---" > "$DEBUG_LOG"
 
-    echo -e "${GREEN}Service Started! Check logs for details.${NC}"
+    # CRITICAL FIX: Direct output to DEBUG_LOG to catch sudo errors
+    sudo nohup "$TERMUX_BASH" "$WATCHDOG_SCRIPT" >> "$DEBUG_LOG" 2>&1 &
+    PID=$!
+    echo $PID > "$WATCHDOG_PID_FILE"
+
+    echo -e "${BLUE}Verifying startup...${NC}"
     sleep 2
+
+    # Check if process is still alive using ps
+    if ps -p "$PID" > /dev/null; then
+        echo -e "${GREEN}Success! Service is running (PID: $PID).${NC}"
+    else
+        echo -e "${RED}FAILED TO START!${NC}"
+        echo -e "${YELLOW}Debug Log Output:${NC}"
+        cat "$DEBUG_LOG"
+        rm "$WATCHDOG_PID_FILE"
+    fi
 }
 
 stop_all() {
-    echo -e "${RED}Stopping all services... (Please grant Sudo access)${NC}"
-
+    echo -e "${RED}Stopping...${NC}"
     if [ -f "$WATCHDOG_PID_FILE" ]; then
         PID=$(cat "$WATCHDOG_PID_FILE")
-        echo "Killing Watchdog (PID: $PID)..."
         sudo kill "$PID" 2>/dev/null
         rm "$WATCHDOG_PID_FILE"
     fi
-
     if [ -f "$MINER_PID_FILE" ]; then
         PID=$(cat "$MINER_PID_FILE")
-        echo "Killing Miner (PID: $PID)..."
         sudo kill "$PID" 2>/dev/null
         rm "$MINER_PID_FILE"
     fi
-
-    echo -e "${GREEN}All services stopped.${NC}"
-    sleep 1
+    echo "Done."
 }
 
-set_mode() {
-    echo "$1" > "$MODE_FILE"
-    echo -e "Mode set to: ${CYAN}$1${NC}"
-}
+set_mode() { echo "$1" > "$MODE_FILE"; echo -e "Mode: ${CYAN}$1${NC}"; }
 
-# --- 4. STATUS DISPLAY ---
+# --- 4. MENU ---
 
 show_status() {
-    echo -e "\n${CYAN}--- MINER STATUS (v10.0) ---${NC}"
-
+    echo -e "\n${CYAN}--- STATUS (v10.1) ---${NC}"
     [ ! -f "$MODE_FILE" ] && echo "AUTO" > "$MODE_FILE"
     MODE=$(cat "$MODE_FILE")
 
-    echo -n "Control Mode: "
-    if [ "$MODE" == "FORCE_START" ]; then echo -e "${RED}FORCE START${NC}";
-    elif [ "$MODE" == "FORCE_STOP" ]; then echo -e "${RED}FORCE STOP${NC}";
-    else echo -e "${GREEN}AUTO (Strict)${NC}"; fi
+    echo -e "Mode: ${CYAN}$MODE${NC}"
 
-    echo -n "Miner State:  "
-    if [ -f "$MINER_PID_FILE" ]; then
-         echo -e "${GREEN}Running (PID File Found)${NC}"
+    if [ -f "$WATCHDOG_PID_FILE" ] && ps -p $(cat "$WATCHDOG_PID_FILE") >/dev/null; then
+        echo -e "Watchdog: ${GREEN}RUNNING${NC}"
     else
-         echo -e "${YELLOW}Stopped${NC}"
+        echo -e "Watchdog: ${RED}STOPPED${NC}"
     fi
 
-    echo -e "${BLUE}Recent Log:${NC}"
-    if [ -f "$LOG_FILE" ]; then
-        tail -n 1 "$LOG_FILE"
-    else
-        echo "No logs yet."
-    fi
+    if [ -f "$MINER_PID_FILE" ]; then echo -e "Miner:    ${GREEN}RUNNING${NC}"; else echo -e "Miner:    ${YELLOW}STOPPED${NC}"; fi
+
     echo "---------------------------"
 }
-
-# --- 5. MAIN MENU ---
 
 main_menu() {
     while true; do
         clear
-        echo -e "${BLUE}=== MINING MANAGER (Sudo Edition) ===${NC}"
+        echo -e "${BLUE}=== MINING MANAGER ===${NC}"
         show_status
-        echo "1. Set Mode: AUTO (Strict 100% + ScreenOff)"
+        echo "1. Set Mode: AUTO"
         echo "2. Set Mode: FORCE START"
         echo "3. Set Mode: FORCE STOP"
         echo "----------------------"
-        echo "4. START Watchdog (Requires Sudo)"
-        echo "5. STOP Everything (Requires Sudo)"
+        echo "4. START Watchdog (Sudo)"
+        echo "5. STOP Everything"
         echo "----------------------"
-        echo "6. Install / Compile XMRig"
+        echo "6. Install / Compile"
         echo "7. Edit Config"
-        echo "8. View Full Logs"
+        echo "8. View Logs (Miner & Debug)"
         echo "9. Exit"
-        echo ""
         read -p "> " c
         case $c in
             1) set_mode "AUTO" ;;
             2) set_mode "FORCE_START" ;;
             3) set_mode "FORCE_STOP" ;;
-            4) start_watchdog ;;
-            5) stop_all ;;
+            4) start_watchdog; read -p "Press Enter..." ;;
+            5) stop_all; read -p "Press Enter..." ;;
             6) install_deps; setup_config ;;
             7) nano "$ENV_FILE" ;;
-            8) tail -f "$LOG_FILE" ;;
+            8)
+               echo -e "${YELLOW}--- DEBUG LOG ---${NC}"
+               cat "$DEBUG_LOG"
+               echo -e "\n${YELLOW}--- MINER LOG ---${NC}"
+               tail -n 10 "$LOG_FILE"
+               read -p "Press Enter..."
+               ;;
             9) exit 0 ;;
         esac
     done
 }
 
-if [ ! -f "$ENV_FILE" ]; then
-    install_deps
-    setup_config
-fi
-
+if [ ! -f "$ENV_FILE" ]; then install_deps; setup_config; fi
 main_menu

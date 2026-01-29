@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ============================================================
-# MINING MANAGER v9.2 (Strict: 100% Battery + Screen OFF Only)
+# MINING MANAGER v9.3 (Strict + Force Mode Support)
 # ============================================================
 
 CONFIG_DIR="$HOME/.config/mining-manager"
@@ -10,6 +10,7 @@ RUNTIME_ENV="$CONFIG_DIR/runtime.env"
 WATCHDOG_PID="$CONFIG_DIR/watchdog.pid"
 MINER_PID="$CONFIG_DIR/xmrig.pid"
 LOG_FILE="$CONFIG_DIR/miner.log"
+MODE_FILE="$CONFIG_DIR/mode"
 
 # Colors
 GREEN='\033[0;32m'
@@ -41,7 +42,8 @@ install_deps() {
 
 setup_config() {
     touch "$RUNTIME_ENV"
-    echo -e "${CYAN}=== SETUP WIZARD (STRICT MODE) ===${NC}"
+    echo "AUTO" > "$MODE_FILE"
+    echo -e "${CYAN}=== SETUP WIZARD ===${NC}"
 
     # --- CONFIG ---
     read -p "Pool Address [Default: gulf.moneroocean.stream:10128]: " cpu_server_in
@@ -52,7 +54,7 @@ setup_config() {
 
     CORES=$(nproc)
     echo "Detected Cores: $CORES"
-    read -p "Threads to use (Only runs when Screen OFF) [Default: $CORES]: " t_idle
+    read -p "Threads to use [Default: $CORES]: " t_idle
     t_idle="${t_idle:-$CORES}"
 
     # Write Config
@@ -113,31 +115,42 @@ start_watchdog() {
     fi
 
     echo -e "${GREEN}Starting Watchdog...${NC}"
-    echo -e "Conditions to mine:\n 1. Battery 100%\n 2. Charger Connected\n 3. Screen OFF"
 
     (
         while true; do
             source "$ENV_FILE"
 
-            # --- CONDITION CHECK ---
+            # Default to AUTO if file missing
+            if [ ! -f "$MODE_FILE" ]; then echo "AUTO" > "$MODE_FILE"; fi
+            CURRENT_MODE=$(cat "$MODE_FILE")
+
+            # --- LOGIC DECISION ---
             SHOULD_MINE=false
             STOP_REASON=""
 
-            if check_power_condition; then
-                if ! is_screen_on; then
-                    SHOULD_MINE=true
-                else
-                    STOP_REASON="Screen is ON"
-                fi
+            if [ "$CURRENT_MODE" == "FORCE_START" ]; then
+                SHOULD_MINE=true
+            elif [ "$CURRENT_MODE" == "FORCE_STOP" ]; then
+                SHOULD_MINE=false
+                STOP_REASON="Force Stop Mode Active"
             else
-                STOP_REASON="Power < 100% or Unplugged"
+                # AUTO MODE (Strict Logic)
+                if check_power_condition; then
+                    if ! is_screen_on; then
+                        SHOULD_MINE=true
+                    else
+                        STOP_REASON="Screen is ON"
+                    fi
+                else
+                    STOP_REASON="Power < 100% or Unplugged"
+                fi
             fi
 
             # --- ACTION ---
             if [ "$SHOULD_MINE" = true ]; then
                 # We should be mining. Is miner running?
                 if [ ! -f "$MINER_PID" ] || ! kill -0 $(cat "$MINER_PID") 2>/dev/null; then
-                    echo "$(date): Starting miner..." >> "$LOG_FILE"
+                    echo "$(date): Starting miner (Mode: $CURRENT_MODE)..." >> "$LOG_FILE"
 
                     nohup $CPU_BIN -o $CPU_SERVER -u $CPU_WALLET -p $CPU_WORKER \
                         --threads=$CPU_THREADS --cpu-no-yield \
@@ -158,39 +171,59 @@ start_watchdog() {
     echo $! > "$WATCHDOG_PID"
 }
 
-stop_all() {
+stop_all_services() {
     echo -e "${RED}Stopping all services...${NC}"
     if [ -f "$WATCHDOG_PID" ]; then
         kill $(cat "$WATCHDOG_PID") 2>/dev/null
         rm "$WATCHDOG_PID"
     fi
-    kill_miner "Manual Stop"
+    kill_miner "Manual Full Stop"
+}
+
+set_mode() {
+    echo "$1" > "$MODE_FILE"
+    echo -e "Mode switched to: ${CYAN}$1${NC}"
+    # Ensure watchdog is running to apply the new mode immediately
+    start_watchdog
 }
 
 # --- 3. MENU INTERFACE ---
 
 show_status() {
-    echo -e "\n${CYAN}--- STRICT MINER STATUS ---${NC}"
+    echo -e "\n${CYAN}--- MINER STATUS ---${NC}"
+
+    # Get Mode
+    [ ! -f "$MODE_FILE" ] && echo "AUTO" > "$MODE_FILE"
+    MODE=$(cat "$MODE_FILE")
+
+    echo -n "Current Mode: "
+    if [ "$MODE" == "FORCE_START" ]; then
+        echo -e "${RED}FORCE START (Ignoring Sensors)${NC}"
+    elif [ "$MODE" == "FORCE_STOP" ]; then
+        echo -e "${RED}FORCE STOP (Mining Disabled)${NC}"
+    else
+        echo -e "${GREEN}AUTO (Strict: 100% Batt + Screen OFF)${NC}"
+    fi
 
     # Power Info
     BAT_CAP=$(cat /sys/class/power_supply/battery/capacity 2>/dev/null)
     BAT_STAT=$(cat /sys/class/power_supply/battery/status 2>/dev/null)
 
-    echo -n "Battery:     "
+    echo -n "Battery:      "
     if [ "$BAT_CAP" -eq 100 ] && [[ "$BAT_STAT" == "Charging" || "$BAT_STAT" == "Full" ]]; then
         echo -e "${GREEN}${BAT_CAP}% ($BAT_STAT)${NC}"
     else
-        echo -e "${RED}${BAT_CAP}% ($BAT_STAT) - FAIL${NC}"
+        echo -e "${RED}${BAT_CAP}% ($BAT_STAT)${NC}"
     fi
 
-    echo -n "Screen:      "
+    echo -n "Screen:       "
     if is_screen_on; then
-        echo -e "${RED}ON (Mining Disabled)${NC}"
+        echo -e "${RED}ON${NC}"
     else
         echo -e "${GREEN}OFF${NC}"
     fi
 
-    echo -n "XMRig Miner: "
+    echo -n "XMRig Miner:  "
     if [ -f "$MINER_PID" ] && kill -0 $(cat "$MINER_PID") 2>/dev/null; then
         source "$ENV_FILE" 2>/dev/null
         echo -e "${GREEN}RUNNING${NC} (Threads: $CPU_THREADS)"
@@ -203,23 +236,28 @@ show_status() {
 main_menu() {
     while true; do
         clear
-        echo -e "${BLUE}=== MINING MANAGER (Strict) ===${NC}"
+        echo -e "${BLUE}=== MINING MANAGER v9.3 ===${NC}"
         show_status
-        echo "1. START Watchdog"
-        echo "2. STOP All"
-        echo "3. Edit Config"
-        echo "4. View Logs"
-        echo "5. RESET Config"
-        echo "6. Exit"
+        echo "1. Set Mode: AUTO (Strict 100% + Screen OFF)"
+        echo "2. Set Mode: FORCE START (Ignore Sensors)"
+        echo "3. Set Mode: FORCE STOP (Kill Miner)"
+        echo "--------------------------------"
+        echo "4. Restart Watchdog"
+        echo "5. KILL EVERYTHING (Exit)"
+        echo "6. Edit Config"
+        echo "7. View Logs"
+        echo "8. Exit Menu"
         echo ""
         read -p "> " choice
         case $choice in
-            1) start_watchdog ;;
-            2) stop_all ;;
-            3) nano "$ENV_FILE" ;;
-            4) tail -f "$LOG_FILE" ;;
-            5) stop_all; rm -rf "$CONFIG_DIR"; install_deps; setup_config ;;
-            6) exit 0 ;;
+            1) set_mode "AUTO" ;;
+            2) set_mode "FORCE_START" ;;
+            3) set_mode "FORCE_STOP" ;;
+            4) stop_all_services; start_watchdog ;;
+            5) stop_all_services; exit 0 ;;
+            6) nano "$ENV_FILE" ;;
+            7) tail -f "$LOG_FILE" ;;
+            8) exit 0 ;;
         esac
     done
 }

@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ============================================================
-# MINING MANAGER v8.6 (SystemD Path Fix)
+# MINING MANAGER v8.7 (Configurable CPU Server)
 # ============================================================
 
 CONFIG_DIR="$HOME/.config/mining-manager"
@@ -82,10 +82,13 @@ setup_config() {
     read -p "Enable GPU Mining? (y/n): " use_gpu_response
     if [[ "$use_gpu_response" =~ ^[Yy]$ ]]; then
         USE_GPU_VAL="true"
+        read -p "GPU Server [Default: gulf.moneroocean.stream:10128]: " gpu_server_in
+        gpu_server="${gpu_server_in:-gulf.moneroocean.stream:10128}"
         read -p "GPU Wallet (Ravencoin/Kawpow): " gpu_wal
         read -p "GPU Worker Name (e.g. MyGamingPC-GPU): " gpu_worker
     else
         USE_GPU_VAL="false"
+        gpu_server="DISABLED"
         gpu_wal="DISABLED"
         gpu_worker="DISABLED"
         echo -e "${RED}GPU Mining Disabled.${NC}"
@@ -94,6 +97,9 @@ setup_config() {
 
     # --- CPU SETUP ---
     echo -e "${YELLOW}CPU Configuration:${NC}"
+    read -p "CPU Server [Default: gulf.moneroocean.stream:20128]: " cpu_server_in
+    cpu_server="${cpu_server_in:-gulf.moneroocean.stream:20128}"
+
     read -p "CPU Wallet (Monero/XMR): " cpu_wal
     read -p "CPU Worker Name (e.g. MyGamingPC-CPU): " cpu_worker
     echo ""
@@ -115,9 +121,10 @@ setup_config() {
 MINER_BIN=$M_BIN
 CPU_BIN=$CHOSEN_CPU_BIN
 GPU_ALGO=kawpow
-GPU_SERVER=gulf.moneroocean.stream:10128
+GPU_SERVER=$gpu_server
 GPU_WALLET=$gpu_wal
 GPU_WORKER=${gpu_worker:-DefaultGPU}
+CPU_SERVER=$cpu_server
 CPU_WALLET=$cpu_wal
 CPU_WORKER=${cpu_worker:-DefaultCPU}
 PROXY_ADDR=$proxy_input
@@ -135,7 +142,7 @@ EOF
 create_services() {
     echo -e "${BLUE}Updating services and scripts...${NC}"
 
-    # GPU SERVICE (Fixed: Uses bash -c to allow variable expansion)
+    # GPU SERVICE
     cat <<EOF > "$HOME/.config/systemd/user/$GPU_SERVICE"
 [Unit]
 Description=GPU Miner (Gminer)
@@ -150,7 +157,7 @@ Restart=always
 Nice=15
 EOF
 
-    # CPU SERVICE (Fixed: Uses bash -c to allow variable expansion)
+    # CPU SERVICE (Updated to use CPU_SERVER variable)
     cat <<EOF > "$HOME/.config/systemd/user/$CPU_SERVICE"
 [Unit]
 Description=CPU Miner
@@ -159,7 +166,7 @@ After=network.target
 Type=simple
 EnvironmentFile=$ENV_FILE
 EnvironmentFile=$RUNTIME_ENV
-ExecStart=/bin/bash -c "exec \${CPU_BIN} -o gulf.moneroocean.stream:20128 -u \${CPU_WALLET} -p \${CPU_WORKER} --rig-id \${CPU_WORKER} --proxy=\${PROXY_ADDR} --tls -k --coin monero -t \${CURRENT_CPU_THREADS} --cpu-no-yield"
+ExecStart=/bin/bash -c "exec \${CPU_BIN} -o \${CPU_SERVER} -u \${CPU_WALLET} -p \${CPU_WORKER} --rig-id \${CPU_WORKER} --proxy=\${PROXY_ADDR} --tls -k --coin monero -t \${CURRENT_CPU_THREADS} --cpu-no-yield"
 Restart=always
 Nice=19
 EOF
@@ -308,11 +315,11 @@ show_status() {
 main_menu() {
     while true; do
         clear
-        echo -e "${BLUE}=== MINING MANAGER v8.6 (Fix) ===${NC}"
+        echo -e "${BLUE}=== MINING MANAGER v8.7 (Configurable Server) ===${NC}"
         show_status
         echo "1. Toggle All Services (On/Off)"
-        echo "2. Edit Config (Names/Wallets/Threads)"
-        echo "3. RESET & REINSTALL (Fix Service Errors)"
+        echo "2. Edit Config (Names/Wallets/Threads/Servers)"
+        echo "3. RESET & REINSTALL (Regenerate Config)"
         echo "4. Logs: CPU"
         echo "5. Logs: GPU"
         echo "6. Logs: Watchdog"

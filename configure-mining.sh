@@ -180,7 +180,7 @@ Type=simple
 EnvironmentFile=$ENV_FILE
 Environment=all_proxy=http://\${PROXY_ADDR}
 Environment=https_proxy=http://\${PROXY_ADDR}
-ExecStart=/bin/bash -c "exec \${MINER_BIN} --algo \${GPU_ALGO} --server \${GPU_SERVER} --user \${GPU_WALLET} --worker \${GPU_WORKER}"
+ExecStart=/bin/bash -c "exec \${MINER_BIN} --algo \${GPU_ALGO} --server \${GPU_SERVER} --user \${GPU_WALLET} --worker \${GPU_WORKER} -p \${GPU_WORKER}"
 Restart=always
 Nice=15
 EOF

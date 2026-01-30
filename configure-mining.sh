@@ -39,10 +39,19 @@ install_deps() {
         $AUR -S --needed --noconfirm gminer-bin
     fi
 
-    # Setup Huge Pages
+    # Setup Huge Pages (1280 pages * 2MB = ~2.5GB RAM)
     echo -e "${BLUE}Optimizing Huge Pages...${NC}"
     sudo sysctl -w vm.nr_hugepages=1280
     echo "vm.nr_hugepages=1280" | sudo tee /etc/sysctl.d/10-mining.conf > /dev/null
+
+    # --- ВАЖНОЕ ИЗМЕНЕНИЕ ДЛЯ XMRIG ---
+    # Даем права на MSR регистры (ускорение хешрейта)
+    echo -e "${BLUE}Setting capabilities for XMRig (MSR Fix)...${NC}"
+    if command -v xmrig-mo &> /dev/null; then
+        sudo setcap cap_sys_rawio,cap_net_admin=eip $(command -v xmrig-mo)
+    elif command -v xmrig &> /dev/null; then
+        sudo setcap cap_sys_rawio,cap_net_admin=eip $(command -v xmrig)
+    fi
 }
 
 setup_config() {
@@ -97,8 +106,8 @@ setup_config() {
 
     # --- CPU SETUP ---
     echo -e "${YELLOW}CPU Configuration:${NC}"
-    read -p "CPU Server [Default: gulf.moneroocean.stream:20128]: " cpu_server_in
-    cpu_server="${cpu_server_in:-gulf.moneroocean.stream:20128}"
+    read -p "CPU Server [Default: gulf.moneroocean.stream:10128]: " cpu_server_in
+    cpu_server="${cpu_server_in:-gulf.moneroocean.stream:10128}"
 
     read -p "CPU Wallet (Monero/XMR): " cpu_wal
     read -p "CPU Worker Name (e.g. MyGamingPC-CPU): " cpu_worker
@@ -142,6 +151,25 @@ EOF
 create_services() {
     echo -e "${BLUE}Updating services and scripts...${NC}"
 
+    # XMRIG CONFIG
+    cat <<EOF > "$CONFIG_DIR/config.json"
+{
+    "autosave": true,
+    "cpu": true,
+    "opencl": false,
+    "cuda": false,
+    "pools": [
+        {
+            "url": "gulf.moneroocean.stream:10128",
+            "user": "auto",
+            "pass": "auto",
+            "keepalive": true,
+            "tls": true
+        }
+    ]
+}
+EOF
+
     # GPU SERVICE
     cat <<EOF > "$HOME/.config/systemd/user/$GPU_SERVICE"
 [Unit]
@@ -157,7 +185,7 @@ Restart=always
 Nice=15
 EOF
 
-    # CPU SERVICE (Updated to use CPU_SERVER variable)
+    # CPU SERVICE
     cat <<EOF > "$HOME/.config/systemd/user/$CPU_SERVICE"
 [Unit]
 Description=CPU Miner
@@ -166,7 +194,10 @@ After=network.target
 Type=simple
 EnvironmentFile=$ENV_FILE
 EnvironmentFile=$RUNTIME_ENV
-ExecStart=/bin/bash -c "exec \${CPU_BIN} -o \${CPU_SERVER} -u \${CPU_WALLET} -p \${CPU_WORKER} --rig-id \${CPU_WORKER} --proxy=\${PROXY_ADDR} --tls -k --coin monero -t \${CURRENT_CPU_THREADS} --cpu-no-yield"
+# --config указывает на файл для сохранения статистики
+# -o и -u перезаписывают настройки из config.json (чтобы подтянуть переменные из env)
+# --threads управляется скриптом
+ExecStart=/bin/bash -c "exec \${CPU_BIN} --config=$CONFIG_DIR/config.json -o \${CPU_SERVER} -u \${CPU_WALLET} -p \${CPU_WORKER} --threads \${CURRENT_CPU_THREADS} --cpu-no-yield"
 Restart=always
 Nice=19
 EOF

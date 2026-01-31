@@ -220,12 +220,19 @@ get_hardware_interrupts() {
     grep -E "xhci|i8042" /proc/interrupts | awk '{ for(i=2;i<=NF;i++) sum+=$i } END { print sum }'
 }
 
-is_video_playing() {
+is_video_enc_dec() {
     if command -v nvidia-smi &> /dev/null; then
         counts=$(nvidia-smi --query-gpu=utilization.decoder,utilization.encoder --format=csv,noheader,nounits)
-        dec=$(echo $counts | cut -d ',' -f 1 | xargs)
-        enc=$(echo $counts | cut -d ',' -f 2 | xargs)
-        if [ "$dec" -gt 0 ] || [ "$enc" -gt 0 ]; then return 0; else return 1; fi
+
+        dec=$(echo "$counts" | cut -d ',' -f 1 | xargs)
+        enc=$(echo "$counts" | cut -d ',' -f 2 | xargs)
+
+        # Trigger ONLY if either is above 20%
+        if [ "${dec:-0}" -gt 20 ] || [ "${enc:-0}" -gt 20 ]; then
+            return 0
+        else
+            return 1
+        fi
     else
         return 1
     fi
@@ -250,7 +257,7 @@ while true; do
 
     LAST_INT_COUNT=$CURRENT_INT_COUNT
 
-    if [ "$MY_IDLE_TIMER" -lt "$IDLE_TIMEOUT" ] || is_video_playing; then
+    if [ "$MY_IDLE_TIMER" -lt "$IDLE_TIMEOUT" ] || is_video_enc_dec; then
         target_mode="active"
         target_threads=$CPU_THREADS_ACTIVE
     else

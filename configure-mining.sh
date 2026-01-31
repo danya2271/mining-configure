@@ -31,7 +31,13 @@ install_deps() {
     echo -e "${BLUE}Installing system components...${NC}"
     if [ -z "$AUR" ]; then echo "AUR helper needed (yay or paru)!"; exit 1; fi
 
-    sudo pacman -S --needed cuda gamemode xmrig git base-devel xprintidle
+    echo -e "${BLUE}Installing xmrig...${NC}"
+    sudo pacman -S --needed xmrig libinput-tools
+
+    echo -e "${BLUE}Installing cuda...${NC}"
+    sudo pacman -S --needed cuda libinput-tools
+
+
 
     # Force install Gminer if not present
     if [ ! -f /usr/bin/gminer ] && [ ! -f /opt/gminer/miner ]; then

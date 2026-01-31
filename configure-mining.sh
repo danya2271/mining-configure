@@ -203,7 +203,7 @@ EnvironmentFile=$RUNTIME_ENV
 # --config указывает на файл для сохранения статистики
 # -o и -u перезаписывают настройки из config.json (чтобы подтянуть переменные из env)
 # --threads управляется скриптом
-ExecStart=/bin/bash -c "exec \${CPU_BIN} --config=$CONFIG_DIR/config.json -o \${CPU_SERVER} -u \${CPU_WALLET} -p \${CPU_WORKER} --threads \${CURRENT_CPU_THREADS} --cpu-no-yield"
+ExecStart=/bin/bash -c "exec \${CPU_BIN} --config=$CONFIG_DIR/config.json -o \${CPU_SERVER} -u \${CPU_WALLET} -p \${CPU_WORKER} --threads \${CURRENT_CPU_THREADS} --cpu-no-yield --proxy=\${PROXY_ADDR}"
 Restart=always
 Nice=19
 EOF

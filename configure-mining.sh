@@ -218,13 +218,11 @@ RUNTIME_ENV="$CONFIG_DIR/runtime.env"
 GPU_SRV="miner-gpu.service"
 CPU_SRV="miner-cpu.service"
 
-MY_IDLE_TIMER=0
-LAST_INT_COUNT=0
-LOOP_DELAY=5
+source "$ENV_FILE" 2>/dev/null
+IDLE_TIMEOUT=${IDLE_TIMEOUT:-60}
 
-get_hardware_interrupts() {
-    grep -E "xhci|i8042" /proc/interrupts | awk '{ for(i=2;i<=NF;i++) sum+=$i } END { print sum }'
-}
+MY_IDLE_TIMER=0
+LOOP_DELAY=5
 
 is_video_enc_dec() {
     if command -v nvidia-smi &> /dev/null; then
@@ -244,7 +242,6 @@ is_video_enc_dec() {
     fi
 }
 
-LAST_INT_COUNT=$(get_hardware_interrupts)
 current_mode="unknown"
 
 echo "Watchdog started. Mode: KERNEL HARDWARE MONITOR"
@@ -252,13 +249,13 @@ echo "Watchdog started. Mode: KERNEL HARDWARE MONITOR"
 while true; do
     source "$ENV_FILE" 2>/dev/null
 
-    CURRENT_INT_COUNT=$(get_hardware_interrupts)
-    DIFF=$((CURRENT_INT_COUNT - LAST_INT_COUNT))
-
-    if [ "$DIFF" -gt 100 ]; then
+    if timeout "$LOOP_DELAY" dd if=/dev/input/mice of=/dev/null bs=1 count=1 2>/dev/null; then
         MY_IDLE_TIMER=0
+        reason="Mouse Input"
+        sleep 1
     else
         MY_IDLE_TIMER=$((MY_IDLE_TIMER + LOOP_DELAY))
+        reason="Idle ($((IDLE_TIMEOUT - MY_IDLE_TIMER))s left)"
     fi
 
     LAST_INT_COUNT=$CURRENT_INT_COUNT
@@ -275,7 +272,7 @@ while true; do
 
     if [ "$current_mode" != "$target_mode" ] || [ "$running_threads" != "$target_threads" ]; then
 
-        echo "State change: $target_mode (Idle Timer: ${MY_IDLE_TIMER}s | Interrupts: +$DIFF)"
+        echo "State change: $target_mode (Reason: $reason)"
 
         if [ "$target_mode" == "active" ]; then
             # --> ACTIVE (Gaming/Work)

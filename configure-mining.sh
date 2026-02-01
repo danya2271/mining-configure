@@ -196,14 +196,21 @@ EOF
 [Unit]
 Description=CPU Miner
 After=network.target
+
 [Service]
 Type=simple
 EnvironmentFile=$ENV_FILE
 EnvironmentFile=$RUNTIME_ENV
-# --config указывает на файл для сохранения статистики
-# -o и -u перезаписывают настройки из config.json (чтобы подтянуть переменные из env)
-# --threads управляется скриптом
-ExecStart=/bin/bash -c "exec \${CPU_BIN} --config=$CONFIG_DIR/config.json -o \${CPU_SERVER} -u \${CPU_WALLET} -p \${CPU_WORKER} --threads \${CURRENT_CPU_THREADS} --cpu-no-yield --proxy=\${PROXY_ADDR}"
+ExecStart=/bin/bash -c " \
+  MAX_CORE=\$(( \${CURRENT_CPU_THREADS} - 1 )); \
+  exec taskset -c 0-\$MAX_CORE \${CPU_BIN} \
+  --config=$CONFIG_DIR/config.json \
+  -o \${CPU_SERVER} \
+  -u \${CPU_WALLET} \
+  -p \${CPU_WORKER} \
+  --threads \${CURRENT_CPU_THREADS} \
+  --cpu-no-yield \
+  --proxy=\${PROXY_ADDR}"
 Restart=always
 Nice=19
 EOF
@@ -360,21 +367,24 @@ main_menu() {
         show_status
         echo "1. Toggle All Services (On/Off)"
         echo "2. Edit Config (Names/Wallets/Threads/Servers)"
-        echo "3. RESET & REINSTALL (Regenerate Config)"
-        echo "4. Logs: CPU"
-        echo "5. Logs: GPU"
-        echo "6. Logs: Watchdog"
-        echo "7. Exit"
+        echo "3. Edit JSON Config (XMRig Advanced)"      # <--- NEW OPTION
+        echo "4. RESET & REINSTALL (Regenerate Config)"  # <--- Renumbered
+        echo "5. Logs: CPU"                              # <--- Renumbered
+        echo "6. Logs: GPU"                              # <--- Renumbered
+        echo "7. Logs: Watchdog"                         # <--- Renumbered
+        echo "8. Exit"                                   # <--- Renumbered
         echo ""
         read -p "> " choice
+
         case $choice in
             1) systemctl --user is-active --quiet $WATCHDOG_SERVICE && systemctl --user stop $WATCHDOG_SERVICE $GPU_SERVICE $CPU_SERVICE || systemctl --user start $WATCHDOG_SERVICE ;;
             2) nano "$ENV_FILE" ;;
-            3) rm -rf "$CONFIG_DIR"; echo "Config deleted. Restarting setup..."; sleep 1; install_deps; setup_config; create_services ;;
-            4) journalctl --user -f -u $CPU_SERVICE ;;
-            5) journalctl --user -f -u $GPU_SERVICE ;;
-            6) journalctl --user -f -u $WATCHDOG_SERVICE ;;
-            7) exit 0 ;;
+            3) nano "$CONFIG_DIR/config.json" ;;         # <--- NEW ACTION
+            4) rm -rf "$CONFIG_DIR"; echo "Config deleted. Restarting setup..."; sleep 1; install_deps; setup_config; create_services ;;
+            5) journalctl --user -f -u $CPU_SERVICE ;;
+            6) journalctl --user -f -u $GPU_SERVICE ;;
+            7) journalctl --user -f -u $WATCHDOG_SERVICE ;;
+            8) exit 0 ;;
         esac
     done
 }

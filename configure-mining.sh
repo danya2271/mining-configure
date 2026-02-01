@@ -37,12 +37,16 @@ install_deps() {
     echo -e "${BLUE}Installing cuda...${NC}"
     sudo pacman -S --needed cuda libinput-tools
 
-
-
-    # Force install Gminer if not present
+    # Install Gminer if not present
     if [ ! -f /usr/bin/gminer ] && [ ! -f /opt/gminer/miner ]; then
         echo -e "${CYAN}Installing Gminer...${NC}"
         $AUR -S --needed --noconfirm gminer-bin
+    fi
+
+    # Install T-Rex if not present
+    if ! command -v t-rex &> /dev/null; then
+        echo -e "${CYAN}Installing T-Rex Miner...${NC}"
+        $AUR -S --needed --noconfirm trex-bin
     fi
 
     # Setup Huge Pages (1280 pages * 2MB = ~2.5GB RAM)
@@ -50,8 +54,7 @@ install_deps() {
     sudo sysctl -w vm.nr_hugepages=1280
     echo "vm.nr_hugepages=1280" | sudo tee /etc/sysctl.d/10-mining.conf > /dev/null
 
-    # --- ВАЖНОЕ ИЗМЕНЕНИЕ ДЛЯ XMRIG ---
-    # Даем права на MSR регистры (ускорение хешрейта)
+    # Allow xmrig-mo/xmrig to use msr tools
     echo -e "${BLUE}Setting capabilities for XMRig (MSR Fix)...${NC}"
     if command -v xmrig-mo &> /dev/null; then
         sudo setcap cap_sys_rawio,cap_net_admin=eip $(command -v xmrig-mo)
@@ -97,19 +100,40 @@ setup_config() {
     read -p "Enable GPU Mining? (y/n): " use_gpu_response
     if [[ "$use_gpu_response" =~ ^[Yy]$ ]]; then
         USE_GPU_VAL="true"
+
+        # --- GPU MINER SELECTION ---
+        echo -e "${YELLOW}GPU Miner Software:${NC}"
+        echo "1. Gminer (Default)"
+        echo "2. T-Rex Miner"
+        read -p "Select [1/2]: " gpu_miner_choice
+        if [[ "$gpu_miner_choice" == "2" ]]; then
+            GPU_MINER_NAME="t-rex"
+            GPU_MINER_PATH="/usr/bin/t-rex"
+            echo -e "${GREEN}Selected: T-Rex Miner${NC}"
+        else
+            GPU_MINER_NAME="gminer"
+            GPU_MINER_PATH=$(find /opt /usr -name "miner" -type f -path "*gminer*" 2>/dev/null | head -n 1)
+            if [ -z "$GPU_MINER_PATH" ]; then GPU_MINER_PATH="/opt/gminer/miner"; fi
+            echo -e "${GREEN}Selected: Gminer${NC}"
+        fi
+
+        read -p "GPU Algorithm [e.g., kawpow, etchash]: " gpu_algo_in
+        gpu_algo="${gpu_algo_in:-kawpow}"
         read -p "GPU Server [Default: gulf.moneroocean.stream:10128]: " gpu_server_in
         gpu_server="${gpu_server_in:-gulf.moneroocean.stream:10128}"
-        read -p "GPU Wallet (Ravencoin/Kawpow): " gpu_wal
+        read -p "GPU Wallet: " gpu_wal
         read -p "GPU Worker Name (e.g. MyGamingPC-GPU): " gpu_worker
     else
         USE_GPU_VAL="false"
+        GPU_MINER_NAME="none"
+        GPU_MINER_PATH="none"
+        gpu_algo="none"
         gpu_server="DISABLED"
         gpu_wal="DISABLED"
         gpu_worker="DISABLED"
         echo -e "${RED}GPU Mining Disabled.${NC}"
     fi
     echo ""
-
     # --- CPU SETUP ---
     echo -e "${YELLOW}CPU Configuration:${NC}"
     read -p "CPU Server [Default: gulf.moneroocean.stream:10128]: " cpu_server_in
@@ -124,33 +148,38 @@ setup_config() {
     echo "Enter IP:PORT (e.g., 127.0.0.1:2081) or leave empty for none"
     read -p "> " proxy_input
 
-    # Detect Gminer Path
-    if [ -f /usr/bin/gminer ]; then
-        M_BIN="/usr/bin/gminer"
-    else
-        M_BIN="/opt/gminer/miner"
-    fi
-
     # Write Config
     cat <<EOF > "$ENV_FILE"
-MINER_BIN=$M_BIN
-CPU_BIN=$CHOSEN_CPU_BIN
-GPU_ALGO=kawpow
+# Configure to mine on gpu or cpu or both
+USE_CPU_MINING=true
+USE_GPU_MINING=$USE_GPU_VAL
+
+# GPU Configuration
+# Available configs: gminer, t-rex
+GPU_MINER_NAME=$GPU_MINER_NAME
+# Available configs: /opt/gminer/miner, /usr/bin/t-rex
+GPU_MINER_BIN=$GPU_MINER_PATH
+GPU_ALGO=$gpu_algo
 GPU_SERVER=$gpu_server
 GPU_WALLET=$gpu_wal
 GPU_WORKER=${gpu_worker:-DefaultGPU}
+USE_PROXY_GPU=true
+
+# CPU Configuration
+CPU_BIN=$CHOSEN_CPU_BIN
 CPU_SERVER=$cpu_server
 CPU_WALLET=$cpu_wal
 CPU_WORKER=${cpu_worker:-DefaultCPU}
+
+# Proxy configuration
 PROXY_ADDR=$proxy_input
-USE_CPU_MINING=true
-USE_GPU_MINING=$USE_GPU_VAL
+
 # Threads Configuration:
-CPU_THREADS_IDLE=26
-CPU_THREADS_ACTIVE=6
+CPU_THREADS_IDLE=14
+CPU_THREADS_ACTIVE=4
 IDLE_TIMEOUT=60
 EOF
-    echo "CURRENT_CPU_THREADS=6" > "$RUNTIME_ENV"
+    echo "CURRENT_CPU_THREADS=4" > "$RUNTIME_ENV"
     echo -e "${GREEN}Configuration saved.${NC}"
 }
 
@@ -177,16 +206,31 @@ create_services() {
 EOF
 
     # GPU SERVICE
-    cat <<EOF > "$HOME/.config/systemd/user/$GPU_SERVICE"
+    cat <<'EOF' > "$HOME/.config/systemd/user/$GPU_SERVICE"
 [Unit]
-Description=GPU Miner (Gminer)
+Description=GPU Miner (Dynamic: Gminer/T-Rex)
 After=network.target
+
 [Service]
 Type=simple
 EnvironmentFile=$ENV_FILE
-Environment=all_proxy=http://\${PROXY_ADDR}
-Environment=https_proxy=http://\${PROXY_ADDR}
-ExecStart=/bin/bash -c "exec \${MINER_BIN} --algo \${GPU_ALGO} --server \${GPU_SERVER} --user \${GPU_WALLET} --worker \${GPU_WORKER} -p \${GPU_WORKER} --proxy \${PROXY_ADDR}"
+
+ExecStart=/bin/bash -c ' \
+    set -e; \
+    echo "Starting ${GPU_MINER_NAME}..."; \
+    CMD=""; \
+    if [[ "$GPU_MINER_NAME" == "t-rex" ]]; then \
+        CMD="${GPU_MINER_BIN} -a ${GPU_ALGO} -o ${GPU_SERVER} -u ${GPU_WALLET} -w ${GPU_WORKER}"; \
+    elif [[ "$GPU_MINER_NAME" == "gminer" ]]; then \
+        CMD="${GPU_MINER_BIN} --algo ${GPU_ALGO} --server ${GPU_SERVER} --user ${GPU_WALLET} --worker ${GPU_WORKER}"; \
+    else \
+        echo "GPU_MINER_NAME is not set or invalid. Exiting."; \
+        exit 1; \
+    fi; \
+    if [[ "${USE_PROXY_GPU}" == "true" ]]; then \
+        CMD="$CMD --proxy ${PROXY_ADDR}"; \
+    fi; \
+    exec $CMD'
 Restart=always
 Nice=15
 EOF
@@ -342,14 +386,15 @@ show_status() {
     echo -e "CPU Miner:   ${YELLOW}${cpu_ver}${NC} (Threads: $cur_threads)"
 
     if [ "$USE_GPU_MINING" = "true" ]; then
-        echo -e "GPU Config:  ${GREEN}ENABLED${NC} (Worker: $GPU_WORKER)"
+        echo -e "GPU Miner:   ${YELLOW}$(echo $GPU_MINER_NAME | tr '[:lower:]' '[:upper:]')${NC} (Algo: $GPU_ALGO)"
+        echo -e "GPU Worker:  ${YELLOW}$GPU_WORKER${NC}"
     else
         echo -e "GPU Config:  ${RED}DISABLED${NC}"
     fi
 
     echo -n "Watchdog:    "; systemctl --user is-active --quiet $WATCHDOG_SERVICE && echo -e "${GREEN}RUNNING${NC}" || echo -e "${RED}OFF${NC}"
 
-    echo -n "GPU Miner:   "
+    echo -n "GPU Miner ";
     if [ "$USE_GPU_MINING" = "true" ]; then
         systemctl --user is-active --quiet $GPU_SERVICE && echo -e "${GREEN}MINING${NC}" || echo -e "${YELLOW}SLEEPING${NC}"
     else

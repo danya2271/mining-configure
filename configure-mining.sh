@@ -148,11 +148,22 @@ setup_config() {
     echo "Enter IP:PORT (e.g., 127.0.0.1:2081) or leave empty for none"
     read -p "> " proxy_input
 
+    echo -e "${YELLOW}Laptop Logic:${NC}"
+    read -p "Enable Laptop Mode? (Only mine if charging + 100% battery) (y/n): " laptop_resp
+    if [[ "$laptop_resp" =~ ^[Yy]$ ]]; then
+        LAPTOP_MODE="true"
+        echo -e "${GREEN}Laptop Mode Enabled.${NC}"
+    else
+        LAPTOP_MODE="false"
+        echo -e "${RED}Laptop Mode Disabled.${NC}"
+    fi
+
     # Write Config
     cat <<EOF > "$ENV_FILE"
 # Configure to mine on gpu or cpu or both
 USE_CPU_MINING=true
 USE_GPU_MINING=$USE_GPU_VAL
+USE_LAPTOP_LOGIC=$LAPTOP_MODE
 
 # GPU Configuration
 # Available configs: gminer, t-rex
@@ -206,7 +217,7 @@ create_services() {
 EOF
 
     # GPU SERVICE
-    cat <<'EOF' > "$HOME/.config/systemd/user/$GPU_SERVICE"
+    cat <<EOF > "$HOME/.config/systemd/user/$GPU_SERVICE"
 [Unit]
 Description=GPU Miner (Dynamic: Gminer/T-Rex)
 After=network.target
@@ -217,20 +228,20 @@ EnvironmentFile=$ENV_FILE
 
 ExecStart=/bin/bash -c ' \
     set -e; \
-    echo "Starting ${GPU_MINER_NAME}..."; \
+    echo "Starting \${GPU_MINER_NAME}..."; \
     CMD=""; \
-    if [[ "$GPU_MINER_NAME" == "t-rex" ]]; then \
-        CMD="${GPU_MINER_BIN} -a ${GPU_ALGO} -o ${GPU_SERVER} -u ${GPU_WALLET} -w ${GPU_WORKER}"; \
-    elif [[ "$GPU_MINER_NAME" == "gminer" ]]; then \
-        CMD="${GPU_MINER_BIN} --algo ${GPU_ALGO} --server ${GPU_SERVER} --user ${GPU_WALLET} --worker ${GPU_WORKER}"; \
+    if [[ "\$GPU_MINER_NAME" == "t-rex" ]]; then \
+        CMD="\${GPU_MINER_BIN} -a \${GPU_ALGO} -o \${GPU_SERVER} -u \${GPU_WALLET} -w \${GPU_WORKER}"; \
+    elif [[ "\$GPU_MINER_NAME" == "gminer" ]]; then \
+        CMD="\${GPU_MINER_BIN} --algo \${GPU_ALGO} --server \${GPU_SERVER} --user \${GPU_WALLET} --worker \${GPU_WORKER}"; \
     else \
         echo "GPU_MINER_NAME is not set or invalid. Exiting."; \
         exit 1; \
     fi; \
-    if [[ "${USE_PROXY_GPU}" == "true" ]]; then \
-        CMD="$CMD --proxy ${PROXY_ADDR}"; \
+    if [[ "\${USE_PROXY_GPU}" == "true" ]]; then \
+        CMD="\$CMD --proxy \${PROXY_ADDR}"; \
     fi; \
-    exec $CMD'
+    exec \$CMD'
 Restart=always
 Nice=15
 EOF
@@ -278,16 +289,42 @@ LOOP_DELAY=5
 is_video_enc_dec() {
     if command -v nvidia-smi &> /dev/null; then
         counts=$(nvidia-smi --query-gpu=utilization.decoder,utilization.encoder --format=csv,noheader,nounits)
-
         dec=$(echo "$counts" | cut -d ',' -f 1 | xargs)
         enc=$(echo "$counts" | cut -d ',' -f 2 | xargs)
+        if [ "${dec:-0}" -gt 20 ] || [ "${enc:-0}" -gt 20 ]; then return 0; else return 1; fi
+    else
+        return 1
+    fi
+}
 
-        # Trigger ONLY if either is above 20%
-        if [ "${dec:-0}" -gt 20 ] || [ "${enc:-0}" -gt 20 ]; then
-            return 0
-        else
-            return 1
+check_laptop_power() {
+    # Returns 0 (true) if we can mine, 1 (false) if we must stop
+    if [ "$USE_LAPTOP_LOGIC" != "true" ]; then return 0; fi
+
+    # Check AC Power (Look for 'Online' status in any AC/ADP supply)
+    # This finds files like /sys/class/power_supply/AC/online
+    ac_connected=0
+    for ps in /sys/class/power_supply/*; do
+        type=$(cat "$ps/type" 2>/dev/null)
+        if [ "$type" == "Mains" ]; then
+            status=$(cat "$ps/online" 2>/dev/null)
+            if [ "$status" == "1" ]; then ac_connected=1; fi
         fi
+    done
+
+    # Check Battery Capacity
+    bat_level=100
+    for ps in /sys/class/power_supply/*; do
+        type=$(cat "$ps/type" 2>/dev/null)
+        if [ "$type" == "Battery" ]; then
+            lvl=$(cat "$ps/capacity" 2>/dev/null)
+            bat_level=${lvl:-0}
+        fi
+    done
+
+    # Logic: Must be plugged in AND 100%
+    if [ "$ac_connected" -eq 1 ] && [ "$bat_level" -eq 100 ]; then
+        return 0
     else
         return 1
     fi
@@ -295,54 +332,75 @@ is_video_enc_dec() {
 
 current_mode="unknown"
 
-echo "Watchdog started. Mode: KERNEL HARDWARE MONITOR"
+echo "Watchdog started. Mode: KERNEL HARDWARE MONITOR + BATTERY CHECK"
 
 while true; do
     source "$ENV_FILE" 2>/dev/null
 
+    # 1. Update Idle Timer
     if timeout "$LOOP_DELAY" dd if=/dev/input/mice of=/dev/null bs=1 count=1 2>/dev/null; then
         MY_IDLE_TIMER=0
-        reason="Mouse Input"
+        input_reason="Mouse Input"
         sleep 1
     else
         MY_IDLE_TIMER=$((MY_IDLE_TIMER + LOOP_DELAY))
-        reason="Idle ($((IDLE_TIMEOUT - MY_IDLE_TIMER))s left)"
+        input_reason="Idle ($((IDLE_TIMEOUT - MY_IDLE_TIMER))s left)"
     fi
 
-    LAST_INT_COUNT=$CURRENT_INT_COUNT
+    # 2. Determine State
 
-    if [ "$MY_IDLE_TIMER" -lt "$IDLE_TIMEOUT" ] || is_video_enc_dec; then
+    # Priority 1: Laptop Power Logic
+    if ! check_laptop_power; then
+        target_mode="battery_stop"
+        target_threads=0
+        reason="Battery < 100% or Unplugged"
+
+    # Priority 2: User Activity (Gaming/Work)
+    elif [ "$MY_IDLE_TIMER" -lt "$IDLE_TIMEOUT" ] || is_video_enc_dec; then
         target_mode="active"
         target_threads=$CPU_THREADS_ACTIVE
+        reason="$input_reason"
+
+    # Priority 3: Idle (Full Mining)
     else
         target_mode="idle"
         target_threads=$CPU_THREADS_IDLE
+        reason="System Idle"
     fi
 
     running_threads=$(grep "CURRENT_CPU_THREADS" "$RUNTIME_ENV" 2>/dev/null | cut -d'=' -f2)
 
+    # 3. Apply State Changes
     if [ "$current_mode" != "$target_mode" ] || [ "$running_threads" != "$target_threads" ]; then
 
         echo "State change: $target_mode (Reason: $reason)"
 
-        if [ "$target_mode" == "active" ]; then
-            # --> ACTIVE (Gaming/Work)
-            sudo wrmsr -a 0x1a4 0x0 2>/dev/null
+        if [ "$target_mode" == "battery_stop" ]; then
+             # --> BATTERY PROTECT (Stop Everything)
+             systemctl --user stop $GPU_SRV
+             systemctl --user stop $CPU_SRV
+             echo "CURRENT_CPU_THREADS=0" > "$RUNTIME_ENV"
 
-            # Stop GPU miner regardless of setting
+        elif [ "$target_mode" == "active" ]; then
+            # --> ACTIVE (Gaming/Work - CPU Low, GPU Off)
+            sudo wrmsr -a 0x1a4 0x0 2>/dev/null
             systemctl --user stop $GPU_SRV
 
             echo "CURRENT_CPU_THREADS=$target_threads" > "$RUNTIME_ENV"
-            [ "$USE_CPU_MINING" = "true" ] && systemctl --user restart $CPU_SRV
+            # Ensure CPU starts if it was stopped by battery mode
+            if [ "$USE_CPU_MINING" = "true" ]; then
+                systemctl --user restart $CPU_SRV
+            fi
 
         else
-            # --> IDLE (Away)
+            # --> IDLE (Away - Full Power)
             sudo wrmsr -a 0x1a4 0xf 2>/dev/null
 
             echo "CURRENT_CPU_THREADS=$target_threads" > "$RUNTIME_ENV"
-            [ "$USE_CPU_MINING" = "true" ] && systemctl --user restart $CPU_SRV
+            if [ "$USE_CPU_MINING" = "true" ]; then
+                systemctl --user restart $CPU_SRV
+            fi
 
-            # Only start GPU miner if enabled in config
             if [ "$USE_GPU_MINING" = "true" ]; then
                 systemctl --user start $GPU_SRV
             else

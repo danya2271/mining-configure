@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ============================================================
-# MINING MANAGER v8.7 (Configurable CPU Server)
+# MINING MANAGER v8.8.1 (Configurable CPU Server)
 # ============================================================
 
 CONFIG_DIR="$HOME/.config/mining-manager"
@@ -31,11 +31,8 @@ install_deps() {
     echo -e "${BLUE}Installing system components...${NC}"
     if [ -z "$AUR" ]; then echo "AUR helper needed (yay or paru)!"; exit 1; fi
 
-    echo -e "${BLUE}Installing xmrig...${NC}"
-    sudo pacman -S --needed xmrig libinput-tools
-
-    echo -e "${BLUE}Installing cuda...${NC}"
-    sudo pacman -S --needed cuda libinput-tools
+    echo -e "${BLUE}Installing required packages...${NC}"
+    sudo pacman -S --needed xmrig cuda libinput-tools wget tar coreutils
 
     # Install Gminer if not present
     if [ ! -f /usr/bin/gminer ] && [ ! -f /opt/gminer/miner ]; then
@@ -49,17 +46,37 @@ install_deps() {
         $AUR -S --needed --noconfirm trex-bin
     fi
 
+    # Install SRBMiner-Multi if not present
+    if [ ! -f /opt/SRBMiner-Multi/SRBMiner-MULTI ]; then
+        echo -e "${CYAN}Installing SRBMiner-Multi (3.1.8)...${NC}"
+        cd /tmp
+        wget -q https://github.com/doktor83/SRBMiner-Multi/releases/download/3.1.8/SRBMiner-Multi-3-1-8-Linux.tar.gz
+        wget -q https://github.com/doktor83/SRBMiner-Multi/releases/download/3.1.8/SRBMiner-Multi-3-1-8-Linux.tar.md5
+        if md5sum -c SRBMiner-Multi-3-1-8-Linux.tar.md5 &> /dev/null; then
+            sudo tar -xzf SRBMiner-Multi-3-1-8-Linux.tar.gz -C /opt/
+            sudo rm -rf /opt/SRBMiner-Multi
+            sudo mv /opt/SRBMiner-Multi-3-1-8 /opt/SRBMiner-Multi
+            echo -e "${GREEN}SRBMiner-Multi installed successfully.${NC}"
+        else
+            echo -e "${RED}MD5 mismatch for SRBMiner! Skipping installation.${NC}"
+        fi
+        rm -f SRBMiner-Multi-3-1-8-Linux.tar.gz SRBMiner-Multi-3-1-8-Linux.tar.md5
+    fi
+
     # Setup Huge Pages (1280 pages * 2MB = ~2.5GB RAM)
     echo -e "${BLUE}Optimizing Huge Pages...${NC}"
     sudo sysctl -w vm.nr_hugepages=1280
     echo "vm.nr_hugepages=1280" | sudo tee /etc/sysctl.d/10-mining.conf > /dev/null
 
-    # Allow xmrig-mo/xmrig to use msr tools
-    echo -e "${BLUE}Setting capabilities for XMRig (MSR Fix)...${NC}"
-    if command -v xmrig-mo &> /dev/null; then
-        sudo setcap cap_sys_rawio,cap_net_admin=eip $(command -v xmrig-mo)
-    elif command -v xmrig &> /dev/null; then
-        sudo setcap cap_sys_rawio,cap_net_admin=eip $(command -v xmrig)
+    # Allow CPU Miners to use msr tools
+    echo -e "${BLUE}Setting capabilities for CPU Miners (MSR Fix)...${NC}"
+    for bin in xmrig-mo xmrig; do
+        if command -v $bin &> /dev/null; then
+            sudo setcap cap_sys_rawio,cap_net_admin=eip $(command -v $bin)
+        fi
+    done
+    if [ -f /opt/SRBMiner-Multi/SRBMiner-MULTI ]; then
+        sudo setcap cap_sys_rawio,cap_net_admin=eip /opt/SRBMiner-Multi/SRBMiner-MULTI
     fi
 }
 
@@ -73,9 +90,18 @@ setup_config() {
     echo -e "${YELLOW}CPU Miner Software:${NC}"
     echo "1. Standard XMRig (Official package)"
     echo "2. XMRig-MO (MoneroOcean Fork - Algo Switching)"
-    read -p "Select [1/2]: " mo_choice
+    echo "3. SRBMiner-Multi"
+    read -p "Select [1/2/3]: " mo_choice
 
-    if [[ "$mo_choice" == "2" ]]; then
+    if [[ "$mo_choice" == "3" ]]; then
+        CPU_MINER_NAME="srbminer"
+        CHOSEN_CPU_BIN="/opt/SRBMiner-Multi/SRBMiner-MULTI"
+        echo -e "${GREEN}Selected: SRBMiner-Multi${NC}"
+        read -p "CPU Algorithm [Default: randomy]: " cpu_algo_in
+        cpu_algo="${cpu_algo_in:-randomy}"
+    elif [[ "$mo_choice" == "2" ]]; then
+        CPU_MINER_NAME="xmrig-mo"
+        cpu_algo="rx/0" # Used as dummy for xmrig config consistency
         echo -e "${BLUE}Checking for XMRig-MO...${NC}"
         if ! command -v xmrig-mo &> /dev/null; then
             echo -e "${CYAN}Installing xmrig-mo from AUR...${NC}"
@@ -88,8 +114,11 @@ setup_config() {
         else
             echo -e "${RED}Failed to install XMRig-MO. Falling back to Standard.${NC}"
             CHOSEN_CPU_BIN="/usr/bin/xmrig"
+            CPU_MINER_NAME="xmrig"
         fi
     else
+        CPU_MINER_NAME="xmrig"
+        cpu_algo="rx/0"
         CHOSEN_CPU_BIN="/usr/bin/xmrig"
         echo -e "${GREEN}Selected: Standard XMRig${NC}"
     fi
@@ -117,9 +146,9 @@ setup_config() {
             echo -e "${GREEN}Selected: Gminer${NC}"
         fi
 
-        read -p "GPU Algorithm [e.g., kawpow, etchash]: " gpu_algo_in
+        read -p "GPU Algorithm[e.g., kawpow, etchash]: " gpu_algo_in
         gpu_algo="${gpu_algo_in:-kawpow}"
-        read -p "GPU Server [Default: gulf.moneroocean.stream:10128]: " gpu_server_in
+        read -p "GPU Server[Default: gulf.moneroocean.stream:10128]: " gpu_server_in
         gpu_server="${gpu_server_in:-gulf.moneroocean.stream:10128}"
         read -p "GPU Wallet: " gpu_wal
         read -p "GPU Worker Name (e.g. MyGamingPC-GPU): " gpu_worker
@@ -134,10 +163,16 @@ setup_config() {
         echo -e "${RED}GPU Mining Disabled.${NC}"
     fi
     echo ""
+
     # --- CPU SETUP ---
     echo -e "${YELLOW}CPU Configuration:${NC}"
-    read -p "CPU Server [Default: gulf.moneroocean.stream:10128]: " cpu_server_in
-    cpu_server="${cpu_server_in:-gulf.moneroocean.stream:10128}"
+    if [[ "$CPU_MINER_NAME" == "srbminer" ]]; then
+        read -p "CPU Server[Default: 51.15.18.10:2905]: " cpu_server_in
+        cpu_server="${cpu_server_in:-51.15.18.10:2905}"
+    else
+        read -p "CPU Server[Default: gulf.moneroocean.stream:10128]: " cpu_server_in
+        cpu_server="${cpu_server_in:-gulf.moneroocean.stream:10128}"
+    fi
 
     read -p "CPU Wallet (Monero/XMR): " cpu_wal
     read -p "CPU Worker Name (e.g. MyGamingPC-CPU): " cpu_worker
@@ -166,9 +201,7 @@ USE_GPU_MINING=$USE_GPU_VAL
 USE_LAPTOP_LOGIC=$LAPTOP_MODE
 
 # GPU Configuration
-# Available configs: gminer, t-rex
 GPU_MINER_NAME=$GPU_MINER_NAME
-# Available configs: /opt/gminer/miner, /usr/bin/t-rex
 GPU_MINER_BIN=$GPU_MINER_PATH
 GPU_ALGO=$gpu_algo
 GPU_SERVER=$gpu_server
@@ -177,6 +210,8 @@ GPU_WORKER=${gpu_worker:-DefaultGPU}
 USE_PROXY_GPU=true
 
 # CPU Configuration
+CPU_MINER_NAME=$CPU_MINER_NAME
+CPU_ALGO=$cpu_algo
 CPU_BIN=$CHOSEN_CPU_BIN
 CPU_SERVER=$cpu_server
 CPU_WALLET=$cpu_wal
@@ -197,14 +232,14 @@ EOF
 create_services() {
     echo -e "${BLUE}Updating services and scripts...${NC}"
 
-    # XMRIG CONFIG
+    # XMRIG CONFIG (Still needed if fallback to XMRig)
     cat <<EOF > "$CONFIG_DIR/config.json"
 {
     "autosave": true,
     "cpu": true,
     "opencl": false,
     "cuda": false,
-    "pools": [
+    "pools":[
         {
             "url": "gulf.moneroocean.stream:10128",
             "user": "auto",
@@ -249,23 +284,28 @@ EOF
     # CPU SERVICE
     cat <<EOF > "$HOME/.config/systemd/user/$CPU_SERVICE"
 [Unit]
-Description=CPU Miner
+Description=CPU Miner (Dynamic: XMRig/SRBMiner)
 After=network.target
 
 [Service]
 Type=simple
 EnvironmentFile=$ENV_FILE
 EnvironmentFile=$RUNTIME_ENV
-ExecStart=/bin/bash -c " \
+ExecStart=/bin/bash -c ' \
   MAX_CORE=\$(( \${CURRENT_CPU_THREADS} - 1 )); \
-  exec taskset -c 0-\$MAX_CORE \${CPU_BIN} \
-  --config=$CONFIG_DIR/config.json \
-  -o \${CPU_SERVER} \
-  -u \${CPU_WALLET} \
-  -p \${CPU_WORKER} \
-  --threads \${CURRENT_CPU_THREADS} \
-  --cpu-no-yield \
-  --proxy=\${PROXY_ADDR}"
+  CMD=""; \
+  if [[ "\$CPU_MINER_NAME" == "srbminer" ]]; then \
+      CMD="\${CPU_BIN} --algorithm \${CPU_ALGO} --pool \${CPU_SERVER} --wallet \${CPU_WALLET} --password d=10000 --cpu-threads \${CURRENT_CPU_THREADS}"; \
+      if [[ -n "\${CPU_WORKER}" ]]; then \
+          CMD="\$CMD --worker \${CPU_WORKER}"; \
+      fi; \
+  else \
+      CMD="\${CPU_BIN} --config=$CONFIG_DIR/config.json -o \${CPU_SERVER} -u \${CPU_WALLET} -p \${CPU_WORKER} --threads \${CURRENT_CPU_THREADS} --cpu-no-yield"; \
+      if [[ -n "\${PROXY_ADDR}" ]]; then \
+          CMD="\$CMD --proxy=\${PROXY_ADDR}"; \
+      fi; \
+  fi; \
+  exec taskset -c 0-\$MAX_CORE \$CMD'
 Restart=always
 Nice=19
 EOF
@@ -302,7 +342,6 @@ check_laptop_power() {
     if [ "$USE_LAPTOP_LOGIC" != "true" ]; then return 0; fi
 
     # Check AC Power (Look for 'Online' status in any AC/ADP supply)
-    # This finds files like /sys/class/power_supply/AC/online
     ac_connected=0
     for ps in /sys/class/power_supply/*; do
         type=$(cat "$ps/type" 2>/dev/null)
@@ -348,20 +387,14 @@ while true; do
     fi
 
     # 2. Determine State
-
-    # Priority 1: Laptop Power Logic
     if ! check_laptop_power; then
         target_mode="battery_stop"
         target_threads=0
         reason="Battery < 100% or Unplugged"
-
-    # Priority 2: User Activity (Gaming/Work)
     elif [ "$MY_IDLE_TIMER" -lt "$IDLE_TIMEOUT" ] || is_video_enc_dec; then
         target_mode="active"
         target_threads=$CPU_THREADS_ACTIVE
         reason="$input_reason"
-
-    # Priority 3: Idle (Full Mining)
     else
         target_mode="idle"
         target_threads=$CPU_THREADS_IDLE
@@ -376,27 +409,23 @@ while true; do
         echo "State change: $target_mode (Reason: $reason)"
 
         if [ "$target_mode" == "battery_stop" ]; then
-             # --> BATTERY PROTECT (Stop Everything)
              systemctl --user stop $GPU_SRV
              systemctl --user stop $CPU_SRV
              echo "CURRENT_CPU_THREADS=0" > "$RUNTIME_ENV"
 
         elif [ "$target_mode" == "active" ]; then
-            # --> ACTIVE (Gaming/Work - CPU Low, GPU Off)
             sudo wrmsr -a 0x1a4 0x0 2>/dev/null
             systemctl --user stop $GPU_SRV
 
             echo "CURRENT_CPU_THREADS=$target_threads" > "$RUNTIME_ENV"
-            # Ensure CPU starts if it was stopped by battery mode
             if [ "$USE_CPU_MINING" = "true" ]; then
                 systemctl --user restart $CPU_SRV
             fi
 
         else
-            # --> IDLE (Away - Full Power)
             sudo wrmsr -a 0x1a4 0xf 2>/dev/null
-
             echo "CURRENT_CPU_THREADS=$target_threads" > "$RUNTIME_ENV"
+
             if [ "$USE_CPU_MINING" = "true" ]; then
                 systemctl --user restart $CPU_SRV
             fi
@@ -439,9 +468,15 @@ show_status() {
     source "$ENV_FILE" 2>/dev/null
     cur_threads=$(grep "CURRENT_CPU_THREADS" "$RUNTIME_ENV" 2>/dev/null | cut -d'=' -f2)
 
-    if [[ "$CPU_BIN" == *xmrig-mo* ]]; then cpu_ver="XMRig-MO"; else cpu_ver="Standard"; fi
+    if [[ "$CPU_MINER_NAME" == "srbminer" ]]; then cpu_ver="SRBMiner-Multi";
+    elif [[ "$CPU_BIN" == *xmrig-mo* ]]; then cpu_ver="XMRig-MO";
+    else cpu_ver="Standard XMRig"; fi
 
     echo -e "CPU Miner:   ${YELLOW}${cpu_ver}${NC} (Threads: $cur_threads)"
+
+    if [[ "$CPU_MINER_NAME" == "srbminer" ]]; then
+        echo -e "CPU Algo:    ${YELLOW}${CPU_ALGO}${NC}"
+    fi
 
     if [ "$USE_GPU_MINING" = "true" ]; then
         echo -e "GPU Miner:   ${YELLOW}$(echo $GPU_MINER_NAME | tr '[:lower:]' '[:upper:]')${NC} (Algo: $GPU_ALGO)"
@@ -466,23 +501,23 @@ show_status() {
 main_menu() {
     while true; do
         clear
-        echo -e "${BLUE}=== MINING MANAGER v8.7 (Configurable Server) ===${NC}"
+        echo -e "${BLUE}=== MINING MANAGER v8.8.1 (Configurable Server) ===${NC}"
         show_status
         echo "1. Toggle All Services (On/Off)"
         echo "2. Edit Config (Names/Wallets/Threads/Servers)"
-        echo "3. Edit JSON Config (XMRig Advanced)"      # <--- NEW OPTION
-        echo "4. RESET & REINSTALL (Regenerate Config)"  # <--- Renumbered
-        echo "5. Logs: CPU"                              # <--- Renumbered
-        echo "6. Logs: GPU"                              # <--- Renumbered
-        echo "7. Logs: Watchdog"                         # <--- Renumbered
-        echo "8. Exit"                                   # <--- Renumbered
+        echo "3. Edit JSON Config (XMRig Advanced)"
+        echo "4. RESET & REINSTALL (Regenerate Config)"
+        echo "5. Logs: CPU"
+        echo "6. Logs: GPU"
+        echo "7. Logs: Watchdog"
+        echo "8. Exit"
         echo ""
         read -p "> " choice
 
         case $choice in
             1) systemctl --user is-active --quiet $WATCHDOG_SERVICE && systemctl --user stop $WATCHDOG_SERVICE $GPU_SERVICE $CPU_SERVICE || systemctl --user start $WATCHDOG_SERVICE ;;
             2) nano "$ENV_FILE" ;;
-            3) nano "$CONFIG_DIR/config.json" ;;         # <--- NEW ACTION
+            3) nano "$CONFIG_DIR/config.json" ;;
             4) rm -rf "$CONFIG_DIR"; echo "Config deleted. Restarting setup..."; sleep 1; install_deps; setup_config; create_services ;;
             5) journalctl --user -f -u $CPU_SERVICE ;;
             6) journalctl --user -f -u $GPU_SERVICE ;;

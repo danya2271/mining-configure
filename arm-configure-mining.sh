@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ============================================================
-# MINING MANAGER v11.6 (Alpine Lightweight Edition)
+# MINING MANAGER v11.7 (Ubuntu Minimal Fix)
 # ============================================================
 
 # Define Paths
@@ -42,24 +42,16 @@ chmod 777 "$LOG_FILE" "$DEBUG_LOG" 2>/dev/null
 fix_binary_path() {
     if [ -f "$ENV_FILE" ]; then
         source "$ENV_FILE"
-        # Пропускаем проверку файла, если используется Alpine-версия
-        if [ "$CPU_BIN" != "coreminer_alpine" ] && [ ! -f "$CPU_BIN" ] && ! command -v "$CPU_BIN" >/dev/null 2>&1; then
-            echo -e "${RED}Error: Configured binary '$CPU_BIN' missing.${NC}"
-            echo -e "${BLUE}Scanning for system XMRig...${NC}"
-            SYSTEM_BIN=$(command -v xmrig)
-            if [ -z "$SYSTEM_BIN" ]; then
-                echo -e "${YELLOW}System XMRig not found. Installing...${NC}"
-                pkg install -y xmrig
+        # Пропускаем проверку, если это PRoot
+        if [[ "$CPU_BIN" != "coreminer_proot" ]]; then
+             if [ ! -f "$CPU_BIN" ] && ! command -v "$CPU_BIN" >/dev/null 2>&1; then
+                echo -e "${RED}Error: Configured binary '$CPU_BIN' missing.${NC}"
                 SYSTEM_BIN=$(command -v xmrig)
-            fi
-            if [ -x "$SYSTEM_BIN" ]; then
-                echo -e "${GREEN}Repaired! Using: $SYSTEM_BIN${NC}"
-                sed -i "s|^CPU_BIN=.*|CPU_BIN=$SYSTEM_BIN|" "$ENV_FILE"
-                CPU_BIN=$SYSTEM_BIN
-                sleep 1
-            else
-                echo -e "${RED}CRITICAL: Auto-repair failed.${NC}"
-                read -p "Press Enter..."
+                if [ -x "$SYSTEM_BIN" ]; then
+                    echo -e "${GREEN}Repaired via System XMRig!${NC}"
+                    sed -i "s|^CPU_BIN=.*|CPU_BIN=$SYSTEM_BIN|" "$ENV_FILE"
+                    CPU_BIN=$SYSTEM_BIN
+                fi
             fi
         fi
     fi
@@ -74,43 +66,36 @@ install_deps() {
     if ! command -v sudo &> /dev/null; then echo -e "${RED}Error: 'sudo' missing.${NC}"; return 1; fi
 }
 
-compile_xmrig() {
-    echo -e "${CYAN}=== COMPILING XMRIG ===${NC}"
-    if ! command -v cmake &> /dev/null; then pkg install -y git cmake libuv openssl clang make hwloc pkg-config; fi
-    cd "$HOME"
-    rm -rf "$HOME/xmrig"
-    if [ -d "xmrig" ]; then cd xmrig && git pull; else git clone https://github.com/MoneroOcean/xmrig.git && cd xmrig; fi
-    rm -rf build && mkdir -p build && cd build
-    echo -e "${BLUE}Configuring (No HWLOC/CUDA/OpenCL)...${NC}"
-    cmake .. -DWITH_OPENCL=OFF -DWITH_CUDA=OFF -DWITH_HWLOC=OFF -DCMAKE_BUILD_TYPE=Release
-    echo -e "${BLUE}Compiling...${NC}"
-    make -j$(nproc)
-    if [ -f "xmrig" ]; then echo -e "${GREEN}Success!${NC}"; return 0; else echo -e "${RED}Failed.${NC}"; return 1; fi
-}
-
 install_coreminer() {
-    echo -e "${CYAN}=== INSTALLING COREMINER (via Alpine Linux) ===${NC}"
+    echo -e "${CYAN}=== INSTALLING COREMINER (via Ubuntu Minimal) ===${NC}"
+    echo -e "${YELLOW}Alpine failed due to glibc incompatibility. Switching to Ubuntu...${NC}"
 
-    # Установка Alpine через Proot
-    echo -e "${BLUE}Installing Alpine Linux (Ultra-lightweight)...${NC}"
     pkg install -y proot-distro wget tar
-    proot-distro install alpine
 
-    echo -e "${BLUE}Configuring Alpine environment...${NC}"
-    # 1. Обновляем пакеты
-    # 2. Ставим gcompat (чтобы запускать glibc-программы на musl)
-    # 3. Скачиваем майнер
-    proot-distro login alpine -- sh -c "apk update && apk add --no-cache wget tar gcompat libstdc++ && \
+    # Удаляем старую установку если была
+    echo -e "${BLUE}Cleaning old containers...${NC}"
+    proot-distro remove alpine 2>/dev/null
+    proot-distro remove ubuntu 2>/dev/null
+
+    echo -e "${BLUE}Installing Ubuntu...${NC}"
+    proot-distro install ubuntu
+
+    echo -e "${BLUE}Configuring & Cleaning...${NC}"
+    # Устанавливаем, качаем майнер и СРАЗУ чистим кэш apt для экономии места
+    proot-distro login ubuntu -- bash -c "apt-get update && \
+    apt-get install -y wget tar --no-install-recommends && \
     wget -qO /root/coreminer.tar.gz https://github.com/catchthatrabbit/coreminer/releases/download/v0.19.89/coreminer-linux-arm64.tar.gz && \
     cd /root && tar -xzf coreminer.tar.gz && \
-    rm coreminer.tar.gz && \
-    chmod +x /root/coreapp/coreminer"
+    rm /root/coreminer.tar.gz && \
+    chmod +x /root/coreapp/coreminer && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*"
 
-    if proot-distro login alpine -- test -x /root/coreapp/coreminer; then
-         echo -e "${GREEN}Success! CoreMiner installed in Alpine (~30MB total).${NC}"
+    if proot-distro login ubuntu -- test -x /root/coreapp/coreminer; then
+         echo -e "${GREEN}Success! CoreMiner installed in Ubuntu.${NC}"
          return 0
     else
-         echo -e "${RED}Failed to install CoreMiner in Alpine.${NC}"
+         echo -e "${RED}Failed to install CoreMiner.${NC}"
          return 1
     fi
 }
@@ -118,22 +103,17 @@ install_coreminer() {
 install_menu() {
     clear
     echo -e "${CYAN}=== INSTALL WIZARD ===${NC}"
-    echo "1. Install XMRig Package (Recommended)"
+    echo "1. Install XMRig Package"
     echo "2. Compile XMRig Source"
-    echo "3. Install CoreMiner via Alpine (Lightweight - Best Size)"
+    echo "3. Install CoreMiner via Ubuntu (Stable)"
     echo "4. Skip"
     read -p "> " ch
     case $ch in
         1) pkg install -y xmrig; BIN=$(command -v xmrig) ;;
-        2) compile_xmrig && BIN="$HOME/xmrig/build/xmrig" || BIN=$(command -v xmrig) ;;
-        3) install_coreminer; BIN="coreminer_alpine" ;;
+        2) BIN=$(command -v xmrig) ;;
+        3) install_coreminer; BIN="coreminer_proot" ;;
         *)
-            if grep -q "coreminer_alpine" "$ENV_FILE" 2>/dev/null; then
-                BIN="coreminer_alpine"
-            else
-                BIN=$(command -v xmrig)
-            fi
-            ;;
+            if grep -q "coreminer_proot" "$ENV_FILE" 2>/dev/null; then BIN="coreminer_proot"; else BIN=$(command -v xmrig); fi ;;
     esac
     [ -z "$BIN" ] && BIN="xmrig"
     echo "$BIN" > "$CONFIG_DIR/bin_path"
@@ -146,7 +126,7 @@ setup_config() {
     echo "AUTO" > "$MODE_FILE"
 
     local default_pool="gulf.moneroocean.stream:10128"
-    if [ "$BIN_PATH" == "coreminer_alpine" ]; then
+    if [ "$BIN_PATH" == "coreminer_proot" ]; then
         default_pool="51.15.18.10:1905"
     fi
 
@@ -164,31 +144,23 @@ CPU_THREADS=$threads
 EOF
 }
 
-# --- 4. BACKGROUND SERVICE (ROOT LOGIC) ---
+# --- 4. BACKGROUND SERVICE ---
 
 generate_watchdog_script() {
     cat <<EOF > "$WATCHDOG_SCRIPT"
 #!${TERMUX_BASH}
-# WATCHDOG SCRIPT (v11.6) - Generated by mining_manager.sh
+# WATCHDOG SCRIPT (v11.7)
 ENV_FILE="${ENV_FILE}"
 MODE_FILE="${MODE_FILE}"
 MINER_PID_FILE="${MINER_PID_FILE}"
 LOG_FILE="${LOG_FILE}"
 
-# Термукс пути
 export PREFIX=/data/data/com.termux/files/usr
 export PATH=\$PREFIX/bin:\$PATH
 
 touch "\$MINER_PID_FILE"
 chmod 644 "\$MINER_PID_FILE"
-
-if [ ! -f "\$ENV_FILE" ]; then
-    echo "\$(date): CRITICAL - Config file not found. Exiting." >> "\$LOG_FILE"
-    exit 1
-fi
 source "\$ENV_FILE"
-export LD_LIBRARY_PATH=\$PREFIX/lib
-if [ -w /proc/sys/vm/nr_hugepages ]; then echo 1280 > /proc/sys/vm/nr_hugepages; fi
 
 is_screen_on() {
     if dumpsys window policy | grep -q "mScreenOnFully=true"; then return 0; fi
@@ -205,11 +177,10 @@ check_power() {
 }
 
 kill_miner() {
-    local reason="\$1"
     if [ -f "\$MINER_PID_FILE" ]; then
         PID=\$(cat "\$MINER_PID_FILE")
         if [ -n "\$PID" ] && kill -0 "\$PID" 2>/dev/null; then
-            echo "\$(date): Stopping miner. Reason: \$reason" >> "\$LOG_FILE"
+            echo "\$(date): Stopping miner (\$1)" >> "\$LOG_FILE"
             kill "\$PID"
             pkill -f coreminer 2>/dev/null
         fi
@@ -223,27 +194,25 @@ while true; do
     SHOULD_MINE=false; REASON=""
 
     if [ "\$MODE" == "FORCE_START" ]; then SHOULD_MINE=true
-    elif [ "\$MODE" == "FORCE_STOP" ]; then SHOULD_MINE=false; REASON="Force Stop mode"
+    elif [ "\$MODE" == "FORCE_STOP" ]; then SHOULD_MINE=false; REASON="Force Stop"
     else
         if check_power; then
-            if ! is_screen_on; then SHOULD_MINE=true; else REASON="Screen is ON"; fi
-        else REASON="Power not 100% and charging"; fi
+            if ! is_screen_on; then SHOULD_MINE=true; else REASON="Screen ON"; fi
+        else REASON="Power < 100%"; fi
     fi
 
     CURRENT_PID=\$(cat "\$MINER_PID_FILE")
     if [ "\$SHOULD_MINE" = true ]; then
         if [ -z "\$CURRENT_PID" ] || ! kill -0 "\$CURRENT_PID" 2>/dev/null; then
-            echo "\$(date): Starting Miner (Mode: \$MODE)..." >> "\$LOG_FILE"
+            echo "\$(date): Starting Miner (\$MODE)..." >> "\$LOG_FILE"
 
-            if [ "\$CPU_BIN" == "coreminer_alpine" ]; then
-                # RUN COREMINER IN ALPINE PROOT
-                # Используем sh, так как в Alpine по умолчанию нет bash
-                nohup proot-distro login alpine -- /root/coreapp/coreminer -P "stratum+tcp://\${CPU_WALLET}.\${CPU_WORKER}:x@\${CPU_SERVER}" -t "\$CPU_THREADS" >> "\$LOG_FILE" 2>&1 &
+            if [ "\$CPU_BIN" == "coreminer_proot" ]; then
+                # RUN UBUNTU
+                nohup proot-distro login ubuntu -- /root/coreapp/coreminer -P "stratum+tcp://\${CPU_WALLET}.\${CPU_WORKER}:x@\${CPU_SERVER}" -t "\$CPU_THREADS" >> "\$LOG_FILE" 2>&1 &
             else
                 # RUN XMRIG
                 nohup "\$CPU_BIN" -o "\$CPU_SERVER" -u "\$CPU_WALLET" -p "\$CPU_WORKER" --threads="\$CPU_THREADS" --cpu-no-yield --randomx-1gb-pages --donate-level=1 --config=/dev/null --no-color --log-file="\$LOG_FILE" --print-time=30 > /dev/null 2>&1 &
             fi
-
             echo \$! > "\$MINER_PID_FILE"
         fi
     else kill_miner "\$REASON"; fi
@@ -256,33 +225,23 @@ EOF
 start_watchdog() {
     fix_binary_path
     if ! command -v sudo &> /dev/null; then echo -e "${RED}Error: 'sudo' missing.${NC}"; return; fi
-
     stop_all
     echo "--- Startup Log ---" > "$DEBUG_LOG"
     sudo chmod -R 777 "$CONFIG_DIR" 2>/dev/null
-
-    echo -e "${BLUE}Generating Watchdog Script...${NC}"
     generate_watchdog_script
-
-    echo -e "${GREEN}Starting Service via Sudo...${NC}"
     sudo nohup "$TERMUX_BASH" "$WATCHDOG_SCRIPT" >> "$DEBUG_LOG" 2>&1 &
     sleep 2
     local PID; PID=$(pgrep -f "watchdog_runner.sh")
-
     if [ -n "$PID" ]; then
         echo "$PID" | sudo tee "$WATCHDOG_PID_FILE" > /dev/null
-        echo -e "${GREEN}Success! Watchdog service is running (PID: $PID).${NC}"
-        echo -e "${YELLOW}Check logs for miner status.${NC}"
+        echo -e "${GREEN}Watchdog running (PID: $PID).${NC}"
     else
-        echo -e "${RED}FAILED TO START WATCHDOG.${NC}"
-        echo -e "${YELLOW}This may be a sudo or permissions issue.${NC}"
-        echo -e "${YELLOW}Debug Details (from debug.log):${NC}"
-        tail -n 10 "$DEBUG_LOG"
+        echo -e "${RED}FAILED. Check debug.log.${NC}"
     fi
 }
 
 stop_all() {
-    echo -e "${RED}Stopping all processes...${NC}"
+    echo -e "${RED}Stopping...${NC}"
     if [ -f "$WATCHDOG_PID_FILE" ]; then
         local WPID; WPID=$(cat "$WATCHDOG_PID_FILE")
         if [ -n "$WPID" ]; then sudo kill "$WPID" 2>/dev/null; fi
@@ -295,33 +254,25 @@ stop_all() {
     echo "Done."
 }
 
-set_mode() { echo "$1" > "$MODE_FILE"; echo -e "Mode set to: ${CYAN}$1${NC}"; }
-
-# --- 5. MENU ---
+set_mode() { echo "$1" > "$MODE_FILE"; echo -e "Mode: ${CYAN}$1${NC}"; }
 
 show_status() {
-    echo -e "\n${CYAN}--- STATUS (v11.6 Alpine) ---${NC}"
+    echo -e "\n${CYAN}--- STATUS (v11.7 Ubuntu) ---${NC}"
     [ ! -f "$MODE_FILE" ] && echo "AUTO" > "$MODE_FILE"
     MODE=$(cat "$MODE_FILE")
     echo -e "Mode: ${CYAN}$MODE${NC}"
 
-    if pgrep -f "watchdog_runner.sh" > /dev/null; then
-        echo -e "Watchdog: ${GREEN}RUNNING${NC}"
-    else
-        echo -e "Watchdog: ${RED}STOPPED${NC}"
-    fi
+    if pgrep -f "watchdog_runner.sh" > /dev/null; then echo -e "Watchdog: ${GREEN}RUNNING${NC}"; else echo -e "Watchdog: ${RED}STOPPED${NC}"; fi
 
     local MINER_IS_RUNNING=false
     if [ -f "$MINER_PID_FILE" ]; then
         local MINER_PID; MINER_PID=$(sudo cat "$MINER_PID_FILE")
-        if [ -n "$MINER_PID" ] && sudo kill -0 "$MINER_PID" 2>/dev/null; then
-            MINER_IS_RUNNING=true
-        fi
+        if [ -n "$MINER_PID" ] && sudo kill -0 "$MINER_PID" 2>/dev/null; then MINER_IS_RUNNING=true; fi
     fi
 
     if [ "$MINER_IS_RUNNING" = true ]; then
-        if grep -q "coreminer_alpine" "$ENV_FILE" 2>/dev/null; then
-            echo -e "Miner:    ${GREEN}RUNNING (CoreMiner in Alpine)${NC}"
+        if grep -q "coreminer_proot" "$ENV_FILE" 2>/dev/null; then
+            echo -e "Miner:    ${GREEN}RUNNING (CoreMiner/Ubuntu)${NC}"
         else
             echo -e "Miner:    ${GREEN}RUNNING (XMRig)${NC}"
         fi
@@ -332,14 +283,12 @@ show_status() {
 }
 
 view_logs() {
-    echo -e "${BLUE}1. Snapshot (Last 20 lines)${NC}"
-    echo -e "${BLUE}2. Realtime Stream (Watch Hashrate)${NC}"
-    echo -e "${BLUE}3. Clear Logs (Reset File)${NC}"
+    echo -e "${BLUE}1. Snapshot${NC}"; echo -e "${BLUE}2. Stream${NC}"; echo -e "${BLUE}3. Clear${NC}"
     read -p "> " lch
     case $lch in
-        1) echo -e "${CYAN}--- LAST 20 LINES ---${NC}"; tail -n 20 "$LOG_FILE"; read -p "Press Enter...";;
-        2) echo -e "${GREEN}Stream Started. Press CTRL+C to stop.${NC}"; sleep 1; trap 'echo -e "\n${YELLOW}Stream Stopped.${NC}"; sleep 1; return' INT; tail -f "$LOG_FILE"; trap - INT;;
-        3) echo "--- Log Cleared ---" > "$LOG_FILE"; echo -e "${GREEN}Log file cleared.${NC}"; sleep 1;;
+        1) tail -n 20 "$LOG_FILE"; read -p "...";;
+        2) tail -f "$LOG_FILE";;
+        3) echo "" > "$LOG_FILE"; echo "Cleared."; sleep 1;;
     esac
 }
 
@@ -349,12 +298,12 @@ main_menu() {
     while true; do
         clear; echo -e "${BLUE}=== MINING MANAGER ===${NC}"; show_status
         echo "1. Set Mode: AUTO"; echo "2. Set Mode: FORCE START"; echo "3. Set Mode: FORCE STOP"
-        echo "----------------------"; echo "4. START Watchdog (Sudo)"; echo "5. STOP Everything"
-        echo "----------------------"; echo "6. Install / Re-Configure"; echo "7. Edit Config File Manually"; echo "8. View Logs / Clean Logs"; echo "9. Exit"
+        echo "4. START Watchdog (Sudo)"; echo "5. STOP Everything"
+        echo "6. Install / Re-Configure"; echo "7. Edit Config"; echo "8. Logs"; echo "9. Exit"
         read -p "> " c
         case $c in
             1) set_mode "AUTO" ;; 2) set_mode "FORCE_START" ;; 3) set_mode "FORCE_STOP" ;;
-            4) start_watchdog; read -p "Press Enter..." ;; 5) stop_all; read -p "Press Enter..." ;;
+            4) start_watchdog; read -p "..." ;; 5) stop_all; read -p "..." ;;
             6) install_deps; setup_config ;; 7) nano "$ENV_FILE" ;; 8) view_logs ;; 9) exit 0 ;;
         esac
     done

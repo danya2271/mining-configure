@@ -295,7 +295,7 @@ ExecStart=/bin/bash -c ' \
   MAX_CORE=\$(( \${CURRENT_CPU_THREADS} - 1 )); \
   CMD=""; \
   if [[ "\$CPU_MINER_NAME" == "srbminer" ]]; then \
-      CMD="\${CPU_BIN} --algorithm \${CPU_ALGO} --pool \${CPU_SERVER} --wallet \${CPU_WALLET}.\${CPU_WORKER} --cpu-threads \${CURRENT_CPU_THREADS}"; \
+      CMD="\${CPU_BIN} --algorithm \${CPU_ALGO} --pool \${CPU_SERVER} --wallet \${CPU_WALLET}.\${CPU_WORKER} --password d=10000 --cpu-threads \${CURRENT_CPU_THREADS}"; \
       if [[ -n "\${CPU_WORKER}" ]]; then \
           CMD="\$CMD --worker \${CPU_WORKER}"; \
       fi; \

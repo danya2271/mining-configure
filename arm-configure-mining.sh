@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ============================================================
-# MINING MANAGER v11.3 (Fix: Status Check Permissions)
+# MINING MANAGER v11.4 (CoreMiner Support + CPU Cores Config)
 # ============================================================
 
 # Define Paths
@@ -44,21 +44,35 @@ fix_binary_path() {
         source "$ENV_FILE"
         if [ ! -f "$CPU_BIN" ] && ! command -v "$CPU_BIN" >/dev/null 2>&1; then
             echo -e "${RED}Error: Configured binary '$CPU_BIN' missing.${NC}"
-            echo -e "${BLUE}Scanning for system XMRig...${NC}"
-            SYSTEM_BIN=$(command -v xmrig)
-            if [ -z "$SYSTEM_BIN" ]; then
-                echo -e "${YELLOW}System XMRig not found. Installing...${NC}"
-                pkg install -y xmrig
-                SYSTEM_BIN=$(command -v xmrig)
-            fi
-            if [ -x "$SYSTEM_BIN" ]; then
-                echo -e "${GREEN}Repaired! Using: $SYSTEM_BIN${NC}"
-                sed -i "s|^CPU_BIN=.*|CPU_BIN=$SYSTEM_BIN|" "$ENV_FILE"
-                CPU_BIN=$SYSTEM_BIN
-                sleep 1
+            if [[ "$CPU_BIN" == *"coreminer"* ]]; then
+                echo -e "${YELLOW}CoreMiner not found. Reinstalling...${NC}"
+                install_coreminer
+                if [ -f "$HOME/coreminer/coreminer" ]; then
+                    echo -e "${GREEN}Repaired!${NC}"
+                    sed -i "s|^CPU_BIN=.*|CPU_BIN=$HOME/coreminer/coreminer|" "$ENV_FILE"
+                    CPU_BIN="$HOME/coreminer/coreminer"
+                    sleep 1
+                else
+                    echo -e "${RED}CRITICAL: Auto-repair failed.${NC}"
+                    read -p "Press Enter..."
+                fi
             else
-                echo -e "${RED}CRITICAL: Auto-repair failed.${NC}"
-                read -p "Press Enter..."
+                echo -e "${BLUE}Scanning for system XMRig...${NC}"
+                SYSTEM_BIN=$(command -v xmrig)
+                if [ -z "$SYSTEM_BIN" ]; then
+                    echo -e "${YELLOW}System XMRig not found. Installing...${NC}"
+                    pkg install -y xmrig
+                    SYSTEM_BIN=$(command -v xmrig)
+                fi
+                if [ -x "$SYSTEM_BIN" ]; then
+                    echo -e "${GREEN}Repaired! Using: $SYSTEM_BIN${NC}"
+                    sed -i "s|^CPU_BIN=.*|CPU_BIN=$SYSTEM_BIN|" "$ENV_FILE"
+                    CPU_BIN=$SYSTEM_BIN
+                    sleep 1
+                else
+                    echo -e "${RED}CRITICAL: Auto-repair failed.${NC}"
+                    read -p "Press Enter..."
+                fi
             fi
         fi
     fi
@@ -69,7 +83,7 @@ fix_binary_path() {
 install_deps() {
     echo -e "${BLUE}Installing dependencies...${NC}"
     pkg update -y
-    pkg install -y git cmake libuv openssl clang make hwloc pkg-config termux-tools jq procps grep tsu
+    pkg install -y git cmake libuv openssl clang make hwloc pkg-config termux-tools jq procps grep tsu curl tar
     if ! command -v sudo &> /dev/null; then echo -e "${RED}Error: 'sudo' missing.${NC}"; return 1; fi
 }
 
@@ -87,17 +101,49 @@ compile_xmrig() {
     if [ -f "xmrig" ]; then echo -e "${GREEN}Success!${NC}"; return 0; else echo -e "${RED}Failed.${NC}"; return 1; fi
 }
 
+install_coreminer() {
+    echo -e "${CYAN}=== INSTALLING COREMINER ===${NC}"
+    mkdir -p "$HOME/coreminer"
+    cd "$HOME/coreminer" || return 1
+    local URL="https://github.com/catchthatrabbit/coreminer/releases/download/v0.19.89/coreminer-linux-arm64.tar.gz"
+    echo -e "${BLUE}Downloading CoreMiner (ARM64)...${NC}"
+    curl -L -o coreminer.tar.gz "$URL"
+    echo -e "${BLUE}Extracting...${NC}"
+    tar -xzf coreminer.tar.gz
+    if [ -d "coreapp" ]; then
+        mv -f coreapp/coreminer ./coreminer
+        rm -rf coreapp
+    fi
+    chmod +x coreminer
+    rm -f coreminer.tar.gz
+    if [ -f "coreminer" ]; then
+         echo -e "${GREEN}Success!${NC}"
+         return 0
+    else
+         echo -e "${RED}Failed.${NC}"
+         return 1
+    fi
+}
+
 install_menu() {
     clear
     echo -e "${CYAN}=== INSTALL WIZARD ===${NC}"
-    echo "1. Install Package (Recommended)"
-    echo "2. Compile Source"
-    echo "3. Skip"
+    echo "1. Install XMRig Package (Recommended)"
+    echo "2. Compile XMRig Source"
+    echo "3. Install CoreMiner (ARM64 Precompiled)"
+    echo "4. Skip"
     read -p "> " ch
     case $ch in
         1) pkg install -y xmrig; BIN=$(command -v xmrig) ;;
         2) compile_xmrig && BIN="$HOME/xmrig/build/xmrig" || BIN=$(command -v xmrig) ;;
-        *) BIN=$(command -v xmrig) ;;
+        3) install_coreminer; BIN="$HOME/coreminer/coreminer" ;;
+        *)
+            if grep -q "coreminer" "$ENV_FILE" 2>/dev/null; then
+                BIN=$(grep "^CPU_BIN=" "$ENV_FILE" | cut -d'=' -f2)
+            else
+                BIN=$(command -v xmrig)
+            fi
+            ;;
     esac
     [ -z "$BIN" ] && BIN="xmrig"
     echo "$BIN" > "$CONFIG_DIR/bin_path"
@@ -108,15 +154,23 @@ setup_config() {
     BIN_PATH=$(cat "$CONFIG_DIR/bin_path")
     rm "$CONFIG_DIR/bin_path"
     echo "AUTO" > "$MODE_FILE"
-    read -p "Pool [gulf.moneroocean.stream:10128]: " pool; pool=${pool:-gulf.moneroocean.stream:10128}
+
+    local default_pool="gulf.moneroocean.stream:10128"
+    if [[ "$BIN_PATH" == *"coreminer"* ]]; then
+        default_pool="51.15.18.10:1905"
+    fi
+
+    read -p "Pool[$default_pool]: " pool; pool=${pool:-$default_pool}
     read -p "Wallet: " wallet
     read -p "Worker [AndroidWorker]: " worker; worker=${worker:-AndroidWorker}
+    read -p "Threads [$(nproc)]: " threads; threads=${threads:-$(nproc)}
+
     cat <<EOF > "$ENV_FILE"
 CPU_BIN=$BIN_PATH
 CPU_SERVER=$pool
 CPU_WALLET=$wallet
 CPU_WORKER=$worker
-CPU_THREADS=$(nproc)
+CPU_THREADS=$threads
 EOF
 }
 
@@ -125,7 +179,7 @@ EOF
 generate_watchdog_script() {
     cat <<EOF > "$WATCHDOG_SCRIPT"
 #!${TERMUX_BASH}
-# WATCHDOG SCRIPT (v11.3) - Generated by mining_manager.sh
+# WATCHDOG SCRIPT (v11.4) - Generated by mining_manager.sh
 ENV_FILE="${ENV_FILE}"
 MODE_FILE="${MODE_FILE}"
 MINER_PID_FILE="${MINER_PID_FILE}"
@@ -140,7 +194,7 @@ if [ ! -f "\$ENV_FILE" ]; then
     exit 1
 fi
 source "\$ENV_FILE"
-if [ -z "\$CPU_BIN" ] || [ -z "\$CPU_SERVER" ] || [ -z "\$CPU_WALLET" ]; then
+if [ -z "\$CPU_BIN" ] ||[ -z "\$CPU_SERVER" ] || [ -z "\$CPU_WALLET" ]; then
     echo "\$(date): CRITICAL - Essential variables are not set. Exiting." >> "\$LOG_FILE"
     exit 1
 fi
@@ -189,7 +243,18 @@ while true; do
     if [ "\$SHOULD_MINE" = true ]; then
         if [ -z "\$CURRENT_PID" ] || ! kill -0 "\$CURRENT_PID" 2>/dev/null; then
             echo "\$(date): Starting Miner (Mode: \$MODE)..." >> "\$LOG_FILE"
-            nohup "\$CPU_BIN" -o "\$CPU_SERVER" -u "\$CPU_WALLET" -p "\$CPU_WORKER" --threads="\$CPU_THREADS" --cpu-no-yield --randomx-1gb-pages --donate-level=1 --config=/dev/null --no-color --log-file="\$LOG_FILE" --print-time=30 > /dev/null 2>&1 &
+
+            # Detect Miner Type
+            MINER_BASENAME=\$(basename "\$CPU_BIN")
+
+            if [ "\$MINER_BASENAME" == "coreminer" ]; then
+                # RUN COREMINER
+                nohup "\$CPU_BIN" -P "stratum+tcp://\${CPU_WALLET}.\${CPU_WORKER}:x@\${CPU_SERVER}" -t "\$CPU_THREADS" >> "\$LOG_FILE" 2>&1 &
+            else
+                # RUN XMRIG
+                nohup "\$CPU_BIN" -o "\$CPU_SERVER" -u "\$CPU_WALLET" -p "\$CPU_WORKER" --threads="\$CPU_THREADS" --cpu-no-yield --randomx-1gb-pages --donate-level=1 --config=/dev/null --no-color --log-file="\$LOG_FILE" --print-time=30 > /dev/null 2>&1 &
+            fi
+
             echo \$! > "\$MINER_PID_FILE"
         fi
     else kill_miner "\$REASON"; fi
@@ -235,6 +300,7 @@ stop_all() {
     fi
     sudo pkill -f watchdog_runner.sh
     sudo pkill -f xmrig
+    sudo pkill -f coreminer
     sudo rm -f "$WATCHDOG_PID_FILE"
     # Don't remove the miner PID file, just clear it
     if [ -f "$MINER_PID_FILE" ]; then sudo sh -c '> "$MINER_PID_FILE"'; fi
@@ -246,8 +312,7 @@ set_mode() { echo "$1" > "$MODE_FILE"; echo -e "Mode set to: ${CYAN}$1${NC}"; }
 # --- 5. MENU ---
 
 show_status() {
-    echo -e "\n${CYAN}--- STATUS (v11.3) ---${NC}"
-    [ ! -f "$MODE_FILE" ] && echo "AUTO" > "$MODE_FILE"
+    echo -e "\n${CYAN}--- STATUS (v11.4) ---${NC}"[ ! -f "$MODE_FILE" ] && echo "AUTO" > "$MODE_FILE"
     MODE=$(cat "$MODE_FILE")
     echo -e "Mode: ${CYAN}$MODE${NC}"
 
@@ -269,7 +334,11 @@ show_status() {
     fi
 
     if [ "$MINER_IS_RUNNING" = true ]; then
-        echo -e "Miner:    ${GREEN}RUNNING${NC}"
+        if grep -q "coreminer" "$ENV_FILE" 2>/dev/null; then
+            echo -e "Miner:    ${GREEN}RUNNING (CoreMiner)${NC}"
+        else
+            echo -e "Miner:    ${GREEN}RUNNING (XMRig)${NC}"
+        fi
     else
         echo -e "Miner:    ${YELLOW}STOPPED${NC}"
     fi

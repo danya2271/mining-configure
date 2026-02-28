@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ============================================================
-# MINING MANAGER v11.4 (CoreMiner Support + CPU Cores Config)
+# MINING MANAGER v11.5 (Ubuntu PRoot CoreMiner Integration)
 # ============================================================
 
 # Define Paths
@@ -42,37 +42,24 @@ chmod 777 "$LOG_FILE" "$DEBUG_LOG" 2>/dev/null
 fix_binary_path() {
     if [ -f "$ENV_FILE" ]; then
         source "$ENV_FILE"
-        if [ ! -f "$CPU_BIN" ] && ! command -v "$CPU_BIN" >/dev/null 2>&1; then
+        # Пропускаем проверку файла, если используется PRoot-версия
+        if [ "$CPU_BIN" != "coreminer_proot" ] && [ ! -f "$CPU_BIN" ] && ! command -v "$CPU_BIN" >/dev/null 2>&1; then
             echo -e "${RED}Error: Configured binary '$CPU_BIN' missing.${NC}"
-            if [[ "$CPU_BIN" == *"coreminer"* ]]; then
-                echo -e "${YELLOW}CoreMiner not found. Reinstalling...${NC}"
-                install_coreminer
-                if [ -f "$HOME/coreminer/coreminer" ]; then
-                    echo -e "${GREEN}Repaired!${NC}"
-                    sed -i "s|^CPU_BIN=.*|CPU_BIN=$HOME/coreminer/coreminer|" "$ENV_FILE"
-                    CPU_BIN="$HOME/coreminer/coreminer"
-                    sleep 1
-                else
-                    echo -e "${RED}CRITICAL: Auto-repair failed.${NC}"
-                    read -p "Press Enter..."
-                fi
-            else
-                echo -e "${BLUE}Scanning for system XMRig...${NC}"
+            echo -e "${BLUE}Scanning for system XMRig...${NC}"
+            SYSTEM_BIN=$(command -v xmrig)
+            if [ -z "$SYSTEM_BIN" ]; then
+                echo -e "${YELLOW}System XMRig not found. Installing...${NC}"
+                pkg install -y xmrig
                 SYSTEM_BIN=$(command -v xmrig)
-                if [ -z "$SYSTEM_BIN" ]; then
-                    echo -e "${YELLOW}System XMRig not found. Installing...${NC}"
-                    pkg install -y xmrig
-                    SYSTEM_BIN=$(command -v xmrig)
-                fi
-                if [ -x "$SYSTEM_BIN" ]; then
-                    echo -e "${GREEN}Repaired! Using: $SYSTEM_BIN${NC}"
-                    sed -i "s|^CPU_BIN=.*|CPU_BIN=$SYSTEM_BIN|" "$ENV_FILE"
-                    CPU_BIN=$SYSTEM_BIN
-                    sleep 1
-                else
-                    echo -e "${RED}CRITICAL: Auto-repair failed.${NC}"
-                    read -p "Press Enter..."
-                fi
+            fi
+            if [ -x "$SYSTEM_BIN" ]; then
+                echo -e "${GREEN}Repaired! Using: $SYSTEM_BIN${NC}"
+                sed -i "s|^CPU_BIN=.*|CPU_BIN=$SYSTEM_BIN|" "$ENV_FILE"
+                CPU_BIN=$SYSTEM_BIN
+                sleep 1
+            else
+                echo -e "${RED}CRITICAL: Auto-repair failed.${NC}"
+                read -p "Press Enter..."
             fi
         fi
     fi
@@ -83,7 +70,7 @@ fix_binary_path() {
 install_deps() {
     echo -e "${BLUE}Installing dependencies...${NC}"
     pkg update -y
-    pkg install -y git cmake libuv openssl clang make hwloc pkg-config termux-tools jq procps grep tsu curl tar
+    pkg install -y git cmake libuv openssl clang make hwloc pkg-config termux-tools jq procps grep tsu curl tar proot-distro
     if ! command -v sudo &> /dev/null; then echo -e "${RED}Error: 'sudo' missing.${NC}"; return 1; fi
 }
 
@@ -102,25 +89,23 @@ compile_xmrig() {
 }
 
 install_coreminer() {
-    echo -e "${CYAN}=== INSTALLING COREMINER ===${NC}"
-    mkdir -p "$HOME/coreminer"
-    cd "$HOME/coreminer" || return 1
-    local URL="https://github.com/catchthatrabbit/coreminer/releases/download/v0.19.89/coreminer-linux-arm64.tar.gz"
-    echo -e "${BLUE}Downloading CoreMiner (ARM64)...${NC}"
-    curl -L -o coreminer.tar.gz "$URL"
-    echo -e "${BLUE}Extracting...${NC}"
-    tar -xzf coreminer.tar.gz
-    if [ -d "coreapp" ]; then
-        mv -f coreapp/coreminer ./coreminer
-        rm -rf coreapp
-    fi
-    chmod +x coreminer
-    rm -f coreminer.tar.gz
-    if [ -f "coreminer" ]; then
-         echo -e "${GREEN}Success!${NC}"
+    echo -e "${CYAN}=== INSTALLING COREMINER (via Ubuntu PRoot) ===${NC}"
+    pkg install -y proot-distro wget tar
+    echo -e "${BLUE}Setting up Ubuntu container...${NC}"
+    proot-distro install ubuntu
+
+    echo -e "${BLUE}Downloading and extracting CoreMiner inside Ubuntu...${NC}"
+    proot-distro login ubuntu -- bash -c "apt-get update && apt-get install -y wget tar && \
+    wget -qO /root/coreminer.tar.gz https://github.com/catchthatrabbit/coreminer/releases/download/v0.19.89/coreminer-linux-arm64.tar.gz && \
+    cd /root && tar -xzf coreminer.tar.gz && \
+    rm /root/coreminer.tar.gz && \
+    chmod +x /root/coreapp/coreminer"
+
+    if proot-distro login ubuntu -- test -x /root/coreapp/coreminer; then
+         echo -e "${GREEN}Success! CoreMiner installed in Ubuntu PRoot.${NC}"
          return 0
     else
-         echo -e "${RED}Failed.${NC}"
+         echo -e "${RED}Failed to install CoreMiner in PRoot.${NC}"
          return 1
     fi
 }
@@ -130,16 +115,16 @@ install_menu() {
     echo -e "${CYAN}=== INSTALL WIZARD ===${NC}"
     echo "1. Install XMRig Package (Recommended)"
     echo "2. Compile XMRig Source"
-    echo "3. Install CoreMiner (ARM64 Precompiled)"
+    echo "3. Install CoreMiner via Ubuntu PRoot (ARM64)"
     echo "4. Skip"
     read -p "> " ch
     case $ch in
         1) pkg install -y xmrig; BIN=$(command -v xmrig) ;;
         2) compile_xmrig && BIN="$HOME/xmrig/build/xmrig" || BIN=$(command -v xmrig) ;;
-        3) install_coreminer; BIN="$HOME/coreminer/coreminer" ;;
+        3) install_coreminer; BIN="coreminer_proot" ;;
         *)
-            if grep -q "coreminer" "$ENV_FILE" 2>/dev/null; then
-                BIN=$(grep "^CPU_BIN=" "$ENV_FILE" | cut -d'=' -f2)
+            if grep -q "coreminer_proot" "$ENV_FILE" 2>/dev/null; then
+                BIN="coreminer_proot"
             else
                 BIN=$(command -v xmrig)
             fi
@@ -156,7 +141,7 @@ setup_config() {
     echo "AUTO" > "$MODE_FILE"
 
     local default_pool="gulf.moneroocean.stream:10128"
-    if [[ "$BIN_PATH" == *"coreminer"* ]]; then
+    if [ "$BIN_PATH" == "coreminer_proot" ]; then
         default_pool="51.15.18.10:1905"
     fi
 
@@ -179,13 +164,15 @@ EOF
 generate_watchdog_script() {
     cat <<EOF > "$WATCHDOG_SCRIPT"
 #!${TERMUX_BASH}
-# WATCHDOG SCRIPT (v11.4) - Generated by mining_manager.sh
+# WATCHDOG SCRIPT (v11.5) - Generated by mining_manager.sh
 ENV_FILE="${ENV_FILE}"
 MODE_FILE="${MODE_FILE}"
 MINER_PID_FILE="${MINER_PID_FILE}"
 LOG_FILE="${LOG_FILE}"
+# Термукс пути для PRoot
+export PREFIX=/data/data/com.termux/files/usr
+export PATH=\$PREFIX/bin:\$PATH
 
-# Make the PID file readable by the user
 touch "\$MINER_PID_FILE"
 chmod 644 "\$MINER_PID_FILE"
 
@@ -194,24 +181,23 @@ if [ ! -f "\$ENV_FILE" ]; then
     exit 1
 fi
 source "\$ENV_FILE"
-if [ -z "\$CPU_BIN" ] ||[ -z "\$CPU_SERVER" ] || [ -z "\$CPU_WALLET" ]; then
-    echo "\$(date): CRITICAL - Essential variables are not set. Exiting." >> "\$LOG_FILE"
-    exit 1
-fi
-export LD_LIBRARY_PATH=/data/data/com.termux/files/usr/lib
+export LD_LIBRARY_PATH=\$PREFIX/lib
 if [ -w /proc/sys/vm/nr_hugepages ]; then echo 1280 > /proc/sys/vm/nr_hugepages; fi
+
 is_screen_on() {
     if dumpsys window policy | grep -q "mScreenOnFully=true"; then return 0; fi
     val=\$(cat /sys/class/backlight/panel0-backlight/brightness 2>/dev/null)
-    if [ "\$val" ] && [ "\$val" -gt 0 ]; then return 0; fi
+    if [ "\$val" ] &&[ "\$val" -gt 0 ]; then return 0; fi
     return 1
 }
+
 check_power() {
     CAP=\$(cat /sys/class/power_supply/battery/capacity 2>/dev/null)
     STAT=\$(cat /sys/class/power_supply/battery/status 2>/dev/null)
     if [ "\$CAP" -eq 100 ] && [[ "\$STAT" == "Charging" || "\$STAT" == "Full" ]]; then return 0; fi
     return 1
 }
+
 kill_miner() {
     local reason="\$1"
     if [ -f "\$MINER_PID_FILE" ]; then
@@ -219,19 +205,17 @@ kill_miner() {
         if [ -n "\$PID" ] && kill -0 "\$PID" 2>/dev/null; then
             echo "\$(date): Stopping miner. Reason: \$reason" >> "\$LOG_FILE"
             kill "\$PID"
+            pkill -f coreminer 2>/dev/null
         fi
-        # Clear the PID file instead of removing it
         > "\$MINER_PID_FILE"
     fi
 }
-if [ ! -x "\$CPU_BIN" ]; then
-    echo "\$(date): CRITICAL - Miner binary not found. Exiting." >> "\$LOG_FILE"
-    exit 1
-fi
+
 while true; do
     if [ ! -f "\$MODE_FILE" ]; then echo "AUTO" > "\$MODE_FILE"; fi
     MODE=\$(cat "\$MODE_FILE")
     SHOULD_MINE=false; REASON=""
+
     if [ "\$MODE" == "FORCE_START" ]; then SHOULD_MINE=true
     elif [ "\$MODE" == "FORCE_STOP" ]; then SHOULD_MINE=false; REASON="Force Stop mode"
     else
@@ -239,17 +223,15 @@ while true; do
             if ! is_screen_on; then SHOULD_MINE=true; else REASON="Screen is ON"; fi
         else REASON="Power not 100% and charging"; fi
     fi
+
     CURRENT_PID=\$(cat "\$MINER_PID_FILE")
     if [ "\$SHOULD_MINE" = true ]; then
         if [ -z "\$CURRENT_PID" ] || ! kill -0 "\$CURRENT_PID" 2>/dev/null; then
             echo "\$(date): Starting Miner (Mode: \$MODE)..." >> "\$LOG_FILE"
 
-            # Detect Miner Type
-            MINER_BASENAME=\$(basename "\$CPU_BIN")
-
-            if [ "\$MINER_BASENAME" == "coreminer" ]; then
-                # RUN COREMINER
-                nohup "\$CPU_BIN" -P "stratum+tcp://\${CPU_WALLET}.\${CPU_WORKER}:x@\${CPU_SERVER}" -t "\$CPU_THREADS" >> "\$LOG_FILE" 2>&1 &
+            if [ "\$CPU_BIN" == "coreminer_proot" ]; then
+                # RUN COREMINER IN UBUNTU PROOT
+                nohup proot-distro login ubuntu -- /root/coreapp/coreminer -P "stratum+tcp://\${CPU_WALLET}.\${CPU_WORKER}:x@\${CPU_SERVER}" -t "\$CPU_THREADS" >> "\$LOG_FILE" 2>&1 &
             else
                 # RUN XMRIG
                 nohup "\$CPU_BIN" -o "\$CPU_SERVER" -u "\$CPU_WALLET" -p "\$CPU_WORKER" --threads="\$CPU_THREADS" --cpu-no-yield --randomx-1gb-pages --donate-level=1 --config=/dev/null --no-color --log-file="\$LOG_FILE" --print-time=30 > /dev/null 2>&1 &
@@ -302,7 +284,6 @@ stop_all() {
     sudo pkill -f xmrig
     sudo pkill -f coreminer
     sudo rm -f "$WATCHDOG_PID_FILE"
-    # Don't remove the miner PID file, just clear it
     if [ -f "$MINER_PID_FILE" ]; then sudo sh -c '> "$MINER_PID_FILE"'; fi
     echo "Done."
 }
@@ -312,7 +293,7 @@ set_mode() { echo "$1" > "$MODE_FILE"; echo -e "Mode set to: ${CYAN}$1${NC}"; }
 # --- 5. MENU ---
 
 show_status() {
-    echo -e "\n${CYAN}--- STATUS (v11.4) ---${NC}"[ ! -f "$MODE_FILE" ] && echo "AUTO" > "$MODE_FILE"
+    echo -e "\n${CYAN}--- STATUS (v11.5) ---${NC}"[ ! -f "$MODE_FILE" ] && echo "AUTO" > "$MODE_FILE"
     MODE=$(cat "$MODE_FILE")
     echo -e "Mode: ${CYAN}$MODE${NC}"
 
@@ -322,20 +303,17 @@ show_status() {
         echo -e "Watchdog: ${RED}STOPPED${NC}"
     fi
 
-    # FIX: Use sudo to read the root-owned PID file and check the process status.
     local MINER_IS_RUNNING=false
     if [ -f "$MINER_PID_FILE" ]; then
-        # Read the PID using sudo to overcome file permissions.
         local MINER_PID; MINER_PID=$(sudo cat "$MINER_PID_FILE")
-        # Check if the PID is not empty and if the process exists (also with sudo).
         if [ -n "$MINER_PID" ] && sudo kill -0 "$MINER_PID" 2>/dev/null; then
             MINER_IS_RUNNING=true
         fi
     fi
 
     if [ "$MINER_IS_RUNNING" = true ]; then
-        if grep -q "coreminer" "$ENV_FILE" 2>/dev/null; then
-            echo -e "Miner:    ${GREEN}RUNNING (CoreMiner)${NC}"
+        if grep -q "coreminer_proot" "$ENV_FILE" 2>/dev/null; then
+            echo -e "Miner:    ${GREEN}RUNNING (CoreMiner in PRoot)${NC}"
         else
             echo -e "Miner:    ${GREEN}RUNNING (XMRig)${NC}"
         fi
